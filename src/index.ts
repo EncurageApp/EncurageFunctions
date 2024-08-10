@@ -120,7 +120,9 @@ const checkEventDoses = async () => {
             }
             return sendPushNotificationsToUser(
               parent.uid,
-              `${child.childName} has a dose available`
+              `${child.childName} can get the next ${capitalizeFirstLetter(
+                event.cycle
+              )} dose now. Tap to give the dose.`
             ).then(() => {
               // Update nextNotificationTime after successfully sending the notification
               const nextNotificationTime = currentTime + 10 * 60 * 1000; // Add 10 minutes
@@ -199,27 +201,27 @@ const checkNextNotificationTime = async () => {
                 notificationNumber = "4th reminder";
                 break;
               case 4:
-                notificationNumber = "final reminder!, episode will be paused";
+                notificationNumber = "final reminder!, episode is now paused";
                 break;
               default:
                 break;
             }
             return sendPushNotificationsToUser(
               parent.uid,
-              `${child.childName} has a dose available, ${notificationNumber}`
+              `${child.childName} can get the next ${capitalizeFirstLetter(
+                event.cycle
+              )} dose now, ${notificationNumber}`
             ).then(() => {
               // Update nextNotificationTime after successfully sending the notification
               const nextNotificationTime = currentTime + 10 * 60 * 1000; // Add 10 minutes
               const notificationCount = event.notificationCount + 1;
 
               if (notificationCount === 5) {
-                return db
-                  .ref(`events/${childSnapshot.key}`)
-                  .update({
-                    state: "paused",
-                    nextNotificationTime: null,
-                    notificationCount: null,
-                  });
+                return db.ref(`events/${childSnapshot.key}`).update({
+                  state: "paused",
+                  nextNotificationTime: null,
+                  notificationCount: null,
+                });
               } else {
                 return db
                   .ref(`events/${childSnapshot.key}`)
@@ -325,4 +327,8 @@ const getStartOfMinute = (epochTime: number): number => {
 const getEndOfMinute = (epochTime: number): number => {
   const startOfMinute = getStartOfMinute(epochTime);
   return startOfMinute + 59999; // End of the current minute (one millisecond before the next minute)
+};
+
+const capitalizeFirstLetter = (str: string): string => {
+  return str?.charAt(0)?.toUpperCase() + str?.slice(1);
 };
