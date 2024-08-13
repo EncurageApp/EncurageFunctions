@@ -213,7 +213,33 @@ const checkNextNotificationTime = async () => {
               )} dose now, ${notificationNumber}`
             ).then(() => {
               // Update nextNotificationTime after successfully sending the notification
-              const nextNotificationTime = currentTime + 10 * 60 * 1000; // Add 10 minutes
+              // const nextNotificationTime = currentTime + 10 * 60 * 1000; // Add 10 minutes
+              let nextNotificationTime: number;
+              // event.snoozeInterval set in app on snooze on mark dose
+              switch (event.notificationCount) {
+                case 1:
+                  nextNotificationTime = event.snoozeInterval
+                    ? currentTime + event.snoozeInterval * 60 * 1000
+                    : currentTime + 10 * 60 * 1000; // add 10 min from current time
+                  break;
+                case 2:
+                  nextNotificationTime = event.snoozeInterval
+                    ? currentTime + event.snoozeInterval * 60 * 1000
+                    : currentTime + 10 * 60 * 1000; // add 10 min from current time
+                  break;
+                case 3:
+                  nextNotificationTime = event.snoozeInterval
+                    ? currentTime + event.snoozeInterval * 60 * 1000
+                    : currentTime + 25 * 60 * 1000; // add 25 min from current time
+                  break;
+                case 4:
+                  nextNotificationTime = event.snoozeInterval
+                    ? currentTime + event.snoozeInterval * 60 * 1000
+                    : currentTime + 15 * 60 * 1000; // add 15 min from current time
+                  break;
+                default:
+                  break;
+              }
               const notificationCount = event.notificationCount + 1;
 
               if (notificationCount === 5) {
@@ -221,6 +247,7 @@ const checkNextNotificationTime = async () => {
                   state: "paused",
                   nextNotificationTime: null,
                   notificationCount: null,
+                  snoozeInterval: null,
                 });
               } else {
                 return db
