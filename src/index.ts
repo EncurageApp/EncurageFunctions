@@ -125,7 +125,8 @@ const checkEventDoses = async () => {
               )} dose now. Tap to give the dose.`
             ).then(() => {
               // Update nextNotificationTime after successfully sending the notification
-              const nextNotificationTime = currentTime + 10 * 60 * 1000; // Add 10 minutes
+              const nextNotificationTime =
+                event.nextScheduledDose + 10 * 60 * 1000; // Add 10 minutes
               const notificationCount = 1;
               return db
                 .ref(`events/${childSnapshot.key}`)
@@ -213,29 +214,32 @@ const checkNextNotificationTime = async () => {
               )} dose now, ${notificationNumber}`
             ).then(() => {
               // Update nextNotificationTime after successfully sending the notification
-              // const nextNotificationTime = currentTime + 10 * 60 * 1000; // Add 10 minutes
               let nextNotificationTime: number;
               // event.snoozeInterval set in app on snooze on mark dose
               switch (event.notificationCount) {
                 case 1:
                   nextNotificationTime = event.snoozeInterval
-                    ? currentTime + event.snoozeInterval * 60 * 1000
-                    : currentTime + 10 * 60 * 1000; // add 10 min from current time
+                    ? event.nextNotificationTime +
+                      event.snoozeInterval * 60 * 1000
+                    : event.nextNotificationTime + 10 * 60 * 1000; // add 10 min
                   break;
                 case 2:
                   nextNotificationTime = event.snoozeInterval
-                    ? currentTime + event.snoozeInterval * 60 * 1000
-                    : currentTime + 10 * 60 * 1000; // add 10 min from current time
+                    ? event.nextNotificationTime +
+                      event.snoozeInterval * 60 * 1000
+                    : event.nextNotificationTime + 10 * 60 * 1000; // add 10 min
                   break;
                 case 3:
                   nextNotificationTime = event.snoozeInterval
-                    ? currentTime + event.snoozeInterval * 60 * 1000
-                    : currentTime + 25 * 60 * 1000; // add 25 min from current time
+                    ? event.nextNotificationTime +
+                      event.snoozeInterval * 60 * 1000
+                    : event.nextNotificationTime + 25 * 60 * 1000; // add 25 min
                   break;
                 case 4:
                   nextNotificationTime = event.snoozeInterval
-                    ? currentTime + event.snoozeInterval * 60 * 1000
-                    : currentTime + 15 * 60 * 1000; // add 15 min from current time
+                    ? event.nextNotificationTime +
+                      event.snoozeInterval * 60 * 1000
+                    : event.nextNotificationTime + 15 * 60 * 1000; // add 15 min
                   break;
                 default:
                   break;
