@@ -97,6 +97,11 @@ const checkEventDoses = async () => {
     .once("value");
 
   const promises: Promise<any>[] = [];
+  console.log(
+    "checkEventDose startOfMinute/endOfMinute",
+    startOfMinute,
+    endOfMinute
+  );
 
   snapshot.forEach((childSnapshot) => {
     const event = childSnapshot.val();
@@ -125,12 +130,10 @@ const checkEventDoses = async () => {
               )} dose now. Tap to give the dose.`
             ).then(() => {
               // Update nextNotificationTime after successfully sending the notification
-              const nextNotificationTime =
-                event.nextScheduledDose + 10 * 60 * 1000; // Add 10 minutes
-              const notificationCount = 1;
+              const nextNotificationTime = currentTime + 10 * 60 * 1000; // Add 10 minutes
               return db
                 .ref(`events/${childSnapshot.key}`)
-                .update({ nextNotificationTime, notificationCount });
+                .update({ nextNotificationTime, notificationCount: 1 });
             });
           });
         })
@@ -202,7 +205,7 @@ const checkNextNotificationTime = async () => {
                 notificationNumber = "4th reminder";
                 break;
               case 4:
-                notificationNumber = "final reminder!, episode is now paused";
+                notificationNumber = "final reminder! Episode is now paused";
                 break;
               default:
                 break;
@@ -219,27 +222,23 @@ const checkNextNotificationTime = async () => {
               switch (event.notificationCount) {
                 case 1:
                   nextNotificationTime = event.snoozeInterval
-                    ? event.nextNotificationTime +
-                      event.snoozeInterval * 60 * 1000
-                    : event.nextNotificationTime + 10 * 60 * 1000; // add 10 min
+                    ? currentTime + event.snoozeInterval * 60 * 1000
+                    : currentTime + 10 * 60 * 1000; // add 10 min
                   break;
                 case 2:
                   nextNotificationTime = event.snoozeInterval
-                    ? event.nextNotificationTime +
-                      event.snoozeInterval * 60 * 1000
-                    : event.nextNotificationTime + 10 * 60 * 1000; // add 10 min
+                    ? currentTime + event.snoozeInterval * 60 * 1000
+                    : currentTime + 25 * 60 * 1000; // add 10 min
                   break;
                 case 3:
                   nextNotificationTime = event.snoozeInterval
-                    ? event.nextNotificationTime +
-                      event.snoozeInterval * 60 * 1000
-                    : event.nextNotificationTime + 25 * 60 * 1000; // add 25 min
+                    ? currentTime + event.snoozeInterval * 60 * 1000
+                    : currentTime + 15 * 60 * 1000; // add 25 min
                   break;
                 case 4:
                   nextNotificationTime = event.snoozeInterval
-                    ? event.nextNotificationTime +
-                      event.snoozeInterval * 60 * 1000
-                    : event.nextNotificationTime + 15 * 60 * 1000; // add 15 min
+                    ? currentTime + event.snoozeInterval * 60 * 1000
+                    : currentTime + 15 * 60 * 1000; // add 15 min
                   break;
                 default:
                   break;
@@ -327,12 +326,26 @@ function sendPushNotificationsToUser(userId, payload) {
 
       const recipientPushToken = snapshot.val();
 
+      const androidConfig: admin.messaging.AndroidConfig = {
+        priority: "high",
+      };
+
+      // const iosConfig: admin.messaging.ApnsConfig = {
+      //   apns: {
+      //     headers: {
+      //       "apns-priority": "10", // Set the priority for iOS (10 is the highest)
+      //     },
+      //   },
+      // };
+
       const message = {
         token: recipientPushToken,
         notification: {
           title: "Encurage",
           body: payload,
         },
+        android: androidConfig,
+        // apns: iosConfig,
       };
       return admin.messaging().send(message);
     })
