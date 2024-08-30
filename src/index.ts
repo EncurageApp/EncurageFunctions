@@ -193,28 +193,41 @@ const checkNextNotificationTime = async () => {
             if (!parentPushToken) {
               throw new Error(`No pushToken for parent with ID ${parent.uid}`);
             }
-            let notificationNumber: string;
+            let notificationBody: string;
             switch (event.notificationCount) {
               case 1:
-                notificationNumber = "2nd reminder";
+                notificationBody = `2nd reminder: ${
+                  child.childName
+                }'s ${capitalizeFirstLetter(event.cycle)} dose is available.`;
                 break;
               case 2:
-                notificationNumber = "3rd reminder";
+                notificationBody = `3rd reminder: ${
+                  child.childName
+                }'s ${capitalizeFirstLetter(event.cycle)} dose is available.`;
                 break;
               case 3:
-                notificationNumber = "4th reminder";
+                notificationBody = `4th reminder: ${
+                  child.childName
+                }'s ${capitalizeFirstLetter(event.cycle)} dose is available.`;
                 break;
               case 4:
-                notificationNumber = "final reminder! Episode is now paused";
+                notificationBody = `${
+                  child.childName
+                }'s ${capitalizeFirstLetter(
+                  event.cycle
+                )} episode is now paused. Tap to resume.`;
                 break;
+                notificationBody = `${
+                  child.childName
+                } can get the next ${capitalizeFirstLetter(
+                  event.cycle
+                )} dose now`;
               default:
                 break;
             }
             return sendPushNotificationsToUser(
               parent.uid,
-              `${child.childName} can get the next ${capitalizeFirstLetter(
-                event.cycle
-              )} dose now, ${notificationNumber}`
+              notificationBody
             ).then(() => {
               // Update nextNotificationTime after successfully sending the notification
               let nextNotificationTime: number;
