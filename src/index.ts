@@ -22,34 +22,36 @@ admin.initializeApp();
 //   response.send('Hello from Firebase!');
 // });
 
-// export const newChildAdded = v1.database
-//   .ref("children/{childId}")
-//   .onCreate((snapshot, context) => {
-//     const child = snapshot.val();
-//     // get parent from child
-//     return getUser(child?.parentId).then((parent) => {
-//       if (!parent) {
-//         return Promise.reject(
-//           new Error(
-//             `Could not locate the parent user with an ID of ${child?.parentId}. Cannot send notification.`
-//           )
-//         );
-//       }
-//       const parentPushToken = parent?.pushToken;
-//       logger.info("parentPushToken", parentPushToken);
+export const newChildAdded = v1.database
+  .ref("children/{childId}")
+  .onCreate(async (snapshot, context) => {
+    const childId = context.params.childId; // Get the childId from the context
+    // const child = snapshot.val();
 
-//       if (!parentPushToken) {
-//         return Promise.reject(new Error(`no pushToken for ${parent.uid}`));
-//       }
-//       // send message
-//       return sendPushNotificationsToUser(
-//         parent.uid,
-//         getNotificationPayload({
-//           body: `${parent.firstName}, You added a child!`,
-//         })
-//       );
-//     });
-//   });
+    // Call the function to create a folder with the same childId
+    await addFolderToChild(childId, "general");
+
+    return null; // Indicate completion
+  });
+
+// Function to add a folder with a random ID to the child's folder array
+const addFolderToChild = async (childId, folderName) => {
+  const db = admin.database();
+
+  // Reference to the child's folders array
+  const folderRef = db.ref(`/folders/${childId}`);
+
+  // Push a new folder with a random ID
+  const newFolderRef = folderRef.push(); // This generates a unique ID for the folder
+
+  await newFolderRef.set({
+    id: newFolderRef.key, // Use the generated key as the folder ID
+    name: folderName,
+    createdAt: admin.database.ServerValue.TIMESTAMP,
+  });
+
+  return newFolderRef.key; // Return the unique key of the new folder
+};
 
 export const pushCron = v1.pubsub.schedule("*/1 * * * *").onRun((context) => {
   console.log("minute_job ran");
