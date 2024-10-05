@@ -107,6 +107,7 @@ const checkEventDoses = async () => {
 
   snapshot.forEach((childSnapshot) => {
     const event = childSnapshot.val();
+    const eventId = childSnapshot.key; // Get the event ID
     if (event.state === "active" && !event.nextNotificationTime) {
       console.log(
         `Processing dose for childId: ${event.childId} due at ${event.nextScheduledDose}`
@@ -129,7 +130,8 @@ const checkEventDoses = async () => {
               parent.uid,
               `${child.childName} can get the next ${capitalizeFirstLetter(
                 event.cycle
-              )} dose now. Tap to give the dose.`
+              )} dose now. Tap to give the dose.`,
+              { childId: event.childId, eventId: eventId }
             ).then(() => {
               // Update nextNotificationTime after successfully sending the notification
               const nextNotificationTime = currentTime + 10 * 60 * 1000; // Add 10 minutes
@@ -173,6 +175,7 @@ const checkNextNotificationTime = async () => {
 
   snapshot.forEach((childSnapshot) => {
     const event = childSnapshot.val();
+    const eventId = childSnapshot.key; // Get the event ID
     if (
       event.state === "active" &&
       event.nextNotificationTime &&
@@ -227,10 +230,10 @@ const checkNextNotificationTime = async () => {
               default:
                 break;
             }
-            return sendPushNotificationsToUser(
-              parent.uid,
-              notificationBody
-            ).then(() => {
+            return sendPushNotificationsToUser(parent.uid, notificationBody, {
+              childId: event.childId,
+              eventId: eventId,
+            }).then(() => {
               // Update nextNotificationTime after successfully sending the notification
               let nextNotificationTime: number;
               // event.snoozeInterval set in app on snooze on mark dose
@@ -327,7 +330,7 @@ function getUser(userId) {
         });
 }
 
-function sendPushNotificationsToUser(userId, payload) {
+function sendPushNotificationsToUser(userId, payload, data) {
   const pushTokensRef = admin.database().ref(`/users/${userId}/pushToken`);
   return pushTokensRef
     .once("value")
@@ -345,33 +348,32 @@ function sendPushNotificationsToUser(userId, payload) {
         priority: "high",
       };
 
-      // const iosConfig: admin.messaging.ApnsConfig = {
-      //   apns: {
-      //     headers: {
-      //       "apns-priority": "10", // Set the priority for iOS (10 is the highest)
-      //     },
-      //   },
-      // };
+      const iosConfig: admin.messaging.ApnsConfig = {
+        headers: {
+          "apns-priority": "10", // Set the priority for iOS (10 is the highest)
+        },
+        payload: {
+          aps: {
+            sound: "default",
+            badge: 0,
+          },
+        },
+      };
 
-      const message = {
+      const message: admin.messaging.Message = {
         token: recipientPushToken,
         notification: {
           title: "Encurage",
           body: payload,
         },
+        data: data,
         android: androidConfig,
-        // apns: iosConfig,
+        apns: iosConfig,
       };
       return admin.messaging().send(message);
     })
     .then((response: any) => {
-      if (response?.failureCount > 0) {
-        const failureMessages = response?.results
-          .filter((result) => result.error)
-          .map((result) => result.error)
-          .join(", ");
-        console.error("sendPushNotificationsToUser error: ", failureMessages);
-      }
+      console.log(`Successfully sent message:`, response);
       return Promise.resolve(response);
     })
     .catch((error) => {
