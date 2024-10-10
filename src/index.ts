@@ -13,6 +13,7 @@ import * as v1 from "firebase-functions/v1";
 import * as logger from "firebase-functions/logger";
 import * as admin from "firebase-admin";
 admin.initializeApp();
+const db = admin.database();
 
 // Start writing functions
 // https://firebase.google.com/docs/functions/typescript
@@ -36,8 +37,6 @@ export const newChildAdded = v1.database
 
 // Function to add a folder with a random ID to the child's folder array
 const addFolderToChild = async (childId, folderName) => {
-  const db = admin.database();
-
   // Reference to the child's folders array
   const folderRef = db.ref(`/folders/${childId}`);
 
@@ -393,3 +392,101 @@ const getEndOfMinute = (epochTime: number): number => {
 const capitalizeFirstLetter = (str: string): string => {
   return str?.charAt(0)?.toUpperCase() + str?.slice(1);
 };
+
+// ********************** https
+
+export const moveOrDeleteFolder = v1.https.onCall(async (data, context) => {
+  const { folder, childID, moveTracks } = data;
+  const folderID = folder.id;
+  let message = "";
+
+  try {
+    // Get all tracks in the folder
+    const tracksSnapshot = await db
+      .ref(`tracking/${childID}`)
+      .orderByChild("folder/id")
+      .equalTo(folderID)
+      .once("value");
+
+    const tracks = tracksSnapshot.val();
+
+    // If no tracks are found, initialize tracks as an empty object
+    if (!tracks) {
+      console.log(`No tracks found in folder ${folderID}`);
+    }
+
+    if (moveTracks) {
+      // Get the general folder ID
+      const generalFolderSnapshot = await db
+        .ref(`folders/${childID}`)
+        .orderByChild("name")
+        .equalTo("general")
+        .once("value");
+      if (!generalFolderSnapshot.exists()) {
+        throw new Error("General folder not found.");
+      }
+
+      const generalFolder = Object.values(generalFolderSnapshot.val())[0];
+
+      // Move tracks to the general folder only if tracks exist
+      if (tracks) {
+        const updates = {};
+        Object.keys(tracks).forEach((trackId) => {
+          updates[`tracking/${childID}/${trackId}/folder`] = generalFolder;
+        });
+        await db.ref().update(updates);
+        message = "and tracks moved to the general folder ";
+      }
+    } else {
+      // Delete the tracks only if tracks exist
+      if (tracks) {
+        const trackDeletePromises = Object.keys(tracks).map((trackId) =>
+          db.ref(`tracking/${childID}/${trackId}`).remove()
+        );
+        await Promise.all(trackDeletePromises);
+        message = "and tracks deleted ";
+      }
+    }
+
+    // Delete the folder after no tracks
+    await db.ref(`folders/${childID}/${folderID}`).remove();
+
+    return {
+      message: `Folder deleted ${message}successfully`,
+      code: "SUCCESS",
+    };
+  } catch (error) {
+    console.error("Error moving or deleting folder tracks or folder:", error);
+    logger.log("error", error);
+    throw new v1.https.HttpsError("internal", error.message);
+  }
+});
+
+export const deleteEntries = v1.https.onCall(async (data, context) => {
+  const { folder, childID } = data;
+  const folderID = folder.id;
+  try {
+    // Get all tracks in the folder
+    const tracksSnapshot = await db
+      .ref(`tracking/${childID}`)
+      .orderByChild("folder/id")
+      .equalTo(folderID)
+      .once("value");
+
+    const tracks = tracksSnapshot.val();
+
+    // Delete the tracks
+    const trackDeletePromises = Object.keys(tracks).map((trackId) =>
+      db.ref(`tracking/${childID}/${trackId}`).remove()
+    );
+    await Promise.all(trackDeletePromises);
+
+    return {
+      message: "All entries deleted successfully",
+      code: "SUCCESS",
+    };
+  } catch (error) {
+    console.error("Error moving or deleting folder tracks or folder:", error);
+    throw new v1.https.HttpsError("internal", error.message);
+  }
+});
