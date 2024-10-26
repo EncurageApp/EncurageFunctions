@@ -396,29 +396,29 @@ const capitalizeFirstLetter = (str: string): string => {
 // ********************** https
 
 export const moveOrDeleteFolder = v1.https.onCall(async (data, context) => {
-  const { folder, childID, moveTracks } = data;
+  const { folder, childID, moveTracks, collection, folderCollection } = data;
   const folderID = folder.id;
   let message = "";
 
   try {
-    // Get all tracks in the folder
+    // Get all entries in the folder
     const tracksSnapshot = await db
-      .ref(`tracking/${childID}`)
+      .ref(`${collection}/${childID}`)
       .orderByChild("folder/id")
       .equalTo(folderID)
       .once("value");
 
-    const tracks = tracksSnapshot.val();
+    const entries = tracksSnapshot.val();
 
-    // If no tracks are found, initialize tracks as an empty object
-    if (!tracks) {
-      console.log(`No tracks found in folder ${folderID}`);
+    // If no entries are found, initialize entries as an empty object
+    if (!entries) {
+      console.log(`No entries found in folder ${folderID}`);
     }
 
     if (moveTracks) {
       // Get the general folder ID
       const generalFolderSnapshot = await db
-        .ref(`folders/${childID}`)
+        .ref(`${folderCollection}/${childID}`)
         .orderByChild("name")
         .equalTo("general")
         .once("value");
@@ -428,56 +428,56 @@ export const moveOrDeleteFolder = v1.https.onCall(async (data, context) => {
 
       const generalFolder = Object.values(generalFolderSnapshot.val())[0];
 
-      // Move tracks to the general folder only if tracks exist
-      if (tracks) {
+      // Move entries to the general folder only if entries exist
+      if (entries) {
         const updates = {};
-        Object.keys(tracks).forEach((trackId) => {
-          updates[`tracking/${childID}/${trackId}/folder`] = generalFolder;
+        Object.keys(entries).forEach((trackId) => {
+          updates[`${collection}/${childID}/${trackId}/folder`] = generalFolder;
         });
         await db.ref().update(updates);
-        message = "and tracks moved to the general folder ";
+        message = "and entries moved to the general folder ";
       }
     } else {
-      // Delete the tracks only if tracks exist
-      if (tracks) {
-        const trackDeletePromises = Object.keys(tracks).map((trackId) =>
-          db.ref(`tracking/${childID}/${trackId}`).remove()
+      // Delete the entries only if entries exist
+      if (entries) {
+        const trackDeletePromises = Object.keys(entries).map((trackId) =>
+          db.ref(`${collection}/${childID}/${trackId}`).remove()
         );
         await Promise.all(trackDeletePromises);
-        message = "and tracks deleted ";
+        message = "and entries deleted ";
       }
     }
 
-    // Delete the folder after no tracks
-    await db.ref(`folders/${childID}/${folderID}`).remove();
+    // Delete the folder after no entries
+    await db.ref(`${folderCollection}/${childID}/${folderID}`).remove();
 
     return {
       message: `Folder deleted ${message}successfully`,
       code: "SUCCESS",
     };
   } catch (error) {
-    console.error("Error moving or deleting folder tracks or folder:", error);
+    console.error("Error moving or deleting folder entries or folder:", error);
     logger.log("error", error);
     throw new v1.https.HttpsError("internal", error.message);
   }
 });
 
 export const deleteEntries = v1.https.onCall(async (data, context) => {
-  const { folder, childID } = data;
+  const { folder, childID, collection } = data;
   const folderID = folder.id;
   try {
-    // Get all tracks in the folder
-    const tracksSnapshot = await db
-      .ref(`tracking/${childID}`)
+    // Get all entry in the folder
+    const entriesSnapshot = await db
+      .ref(`${collection}/${childID}`)
       .orderByChild("folder/id")
       .equalTo(folderID)
       .once("value");
 
-    const tracks = tracksSnapshot.val();
+    const entry = entriesSnapshot.val();
 
-    // Delete the tracks
-    const trackDeletePromises = Object.keys(tracks).map((trackId) =>
-      db.ref(`tracking/${childID}/${trackId}`).remove()
+    // Delete the entry
+    const trackDeletePromises = Object.keys(entry).map((trackId) =>
+      db.ref(`${collection}/${childID}/${trackId}`).remove()
     );
     await Promise.all(trackDeletePromises);
 
@@ -486,7 +486,7 @@ export const deleteEntries = v1.https.onCall(async (data, context) => {
       code: "SUCCESS",
     };
   } catch (error) {
-    console.error("Error moving or deleting folder tracks or folder:", error);
+    console.error("Error moving or deleting folder entry or folder:", error);
     throw new v1.https.HttpsError("internal", error.message);
   }
 });
