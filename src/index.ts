@@ -393,7 +393,7 @@ const capitalizeFirstLetter = (str: string): string => {
   return str?.charAt(0)?.toUpperCase() + str?.slice(1);
 };
 
-// ********************** https
+// *********************************************** https ************************************************************
 
 export const moveOrDeleteFolder = v1.https.onCall(async (data, context) => {
   const { folder, childID, moveTracks, collection, folderCollection } = data;
@@ -490,3 +490,58 @@ export const deleteEntries = v1.https.onCall(async (data, context) => {
     throw new v1.https.HttpsError("internal", error.message);
   }
 });
+
+// Helper function to generate an 8-character alphanumeric code
+function generateRandomCode(length: number = 8): string {
+  const characters =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let code = "";
+  for (let i = 0; i < length; i++) {
+    const randomIndex = Math.floor(Math.random() * characters.length);
+    code += characters[randomIndex];
+  }
+  return code;
+}
+
+// Callable function to create a caregiver invite in Realtime Database
+export const generateCaregiverInviteCode = v1.https.onCall(
+  async (data, context) => {
+    const { parentId } = data;
+    if (!parentId) {
+      throw new v1.https.HttpsError(
+        "invalid-argument",
+        "The function must be called with a valid parentId."
+      );
+    }
+
+    // Generate the 8-character code
+    const code = generateRandomCode();
+
+    // Calculate creation and expiration times (24 hours after creation)
+    const creationTime = Date.now();
+    const expirationTime = creationTime + 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+
+    // Data to save to Realtime Database
+    const inviteData = {
+      parentId,
+      code,
+      creationTime,
+      expirationTime,
+    };
+
+    // Save invite to Realtime Database under `caregiver_invite`
+    try {
+      const inviteRef = await admin
+        .database()
+        .ref("caregiver_invite")
+        .push(inviteData);
+      return { success: true, inviteId: inviteRef.key, code };
+    } catch (error) {
+      console.error("Error creating caregiver invite:", error);
+      throw new v1.https.HttpsError(
+        "internal",
+        "Failed to create caregiver invite."
+      );
+    }
+  }
+);
