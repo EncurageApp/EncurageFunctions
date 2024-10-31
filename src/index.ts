@@ -52,6 +52,46 @@ const addFolderToChild = async (childId, folderName) => {
   return newFolderRef.key; // Return the unique key of the new folder
 };
 
+export const deleteExpiredCodesCron = v1.pubsub
+  .schedule("0 0 * * *")
+  .onRun(async (context) => {
+    console.log("daily_job ran");
+
+    const caregiverInviteRef = db.ref("caregiver_invite");
+    const currentTime = Date.now();
+
+    try {
+      // Fetch all caregiver_invite entries
+      const snapshot = await caregiverInviteRef.once("value");
+
+      if (!snapshot.exists()) {
+        console.log("No caregiver invites found.");
+        return null;
+      }
+
+      const expiredDeletes = [];
+      snapshot.forEach((childSnapshot) => {
+        const inviteData = childSnapshot.val();
+        if (inviteData.expirationTime <= currentTime) {
+          // Schedule deletion of expired code
+          expiredDeletes.push(childSnapshot.ref.remove());
+        }
+      });
+
+      // Execute all delete promises
+      await Promise.all(expiredDeletes);
+
+      console.log("Expired codes deleted successfully.");
+      return { message: "Expired codes cleanup completed" };
+    } catch (error) {
+      console.error("Error deleting expired codes:", error);
+      throw new v1.https.HttpsError(
+        "internal",
+        "An error occurred during expired code cleanup."
+      );
+    }
+  });
+//
 export const pushCron = v1.pubsub.schedule("*/1 * * * *").onRun((context) => {
   console.log("minute_job ran");
   return checkForOutStandingNotifications()
@@ -84,7 +124,6 @@ function checkForOutStandingNotifications() {
 }
 
 const checkEventDoses = async () => {
-  const db = admin.database();
   const currentTime = Date.now();
   const startOfMinute = getStartOfMinute(currentTime);
   const endOfMinute = getEndOfMinute(currentTime); // End of current minute
@@ -157,7 +196,6 @@ const checkEventDoses = async () => {
 };
 
 const checkNextNotificationTime = async () => {
-  const db = admin.database();
   const currentTime = Date.now();
   const startOfMinute = getStartOfMinute(currentTime);
   const endOfMinute = getEndOfMinute(currentTime); // End of current minute
@@ -329,7 +367,11 @@ function getUser(userId) {
         });
 }
 
-function sendPushNotificationsToUser(userId, payload, data) {
+function sendPushNotificationsToUser(
+  userId: string,
+  payload: string,
+  data?: any
+) {
   const pushTokensRef = admin.database().ref(`/users/${userId}/pushToken`);
   return pushTokensRef
     .once("value")
@@ -545,3 +587,100 @@ export const generateCaregiverInviteCode = v1.https.onCall(
     }
   }
 );
+
+export const verifyAndAddCaregiver = v1.https.onCall(async (data, context) => {
+  const { code, caregiverId, caregiverName } = data;
+
+  if (!code || !caregiverId) {
+    throw new v1.https.HttpsError(
+      "invalid-argument",
+      "Code and caregiverId must be provided."
+    );
+  }
+
+  // Step 1: Reference to caregiver_invite collection
+  const caregiverInviteRef = db.ref("caregiver_invite"); //caregiver_invite
+
+  try {
+    // Query caregiver_invite collection by code
+    const snapshot = await caregiverInviteRef
+      .orderByChild("code")
+      .equalTo(code)
+      .once("value");
+
+    if (!snapshot.exists()) {
+      // If no match is found, return "invalid code"
+      return { message: "invalid code" };
+    }
+
+    // Step 2: If the code is found, extract invite data
+    const inviteKey = Object.keys(snapshot.val())[0]; // Get the key
+    const inviteData = snapshot.val()[inviteKey];
+
+    // Step 3: Check expiration
+    const currentTime = Date.now();
+    if (inviteData.expirationTime <= currentTime) {
+      return { message: "code expired" };
+    }
+
+    // Step 4: Code is valid, add caregiver entry
+    const caregiverRef = db.ref("caregiver").push();
+    await caregiverRef.set({
+      caregiver_id: caregiverId,
+      create_date: currentTime,
+      guardian: false,
+      parent_id: inviteData.parentId,
+      id: caregiverRef.key,
+    });
+
+    //remove code
+
+    await caregiverInviteRef.child(inviteKey).remove();
+
+    // Send push notification to the parent
+
+    await sendPushAfterInviteAccept(inviteData.parentId, caregiverName);
+
+    return {
+      message: "caregiver added successfully",
+      caregiverId: caregiverRef.key,
+    };
+  } catch (error) {
+    console.error("Error verifying and adding caregiver:", error);
+    throw new v1.https.HttpsError(
+      "internal",
+      "An error occurred while processing the request."
+    );
+  }
+});
+
+const sendPushAfterInviteAccept = async (parentId: string, userName) => {
+  try {
+    return getUser(parentId).then((parent) => {
+      if (!parent) {
+        throw new Error(`Parent not found for ID ${parentId}`);
+      }
+      const parentPushToken = parent?.pushToken;
+      if (!parentPushToken) {
+        throw new Error(`No pushToken for parent with ID ${parent.uid}`);
+      }
+
+      return sendPushNotificationsToUser(
+        parent.uid,
+        `${userName} accepted care family invitation. Please complete setup in app.`
+      )
+        .then(() => {})
+        .catch((error) => {
+          console.error(
+            "Error sending care family invitation Push Notification",
+            error
+          );
+        });
+    });
+  } catch (error) {
+    console.error(
+      "Error sending care family invitation Push Notification",
+      error
+    );
+  }
+};
