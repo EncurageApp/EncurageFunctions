@@ -536,7 +536,7 @@ export const deleteEntries = v1.https.onCall(async (data, context) => {
 // Helper function to generate an 8-character alphanumeric code
 function generateRandomCode(length: number = 8): string {
   const characters =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz023456789";
   let code = "";
   for (let i = 0; i < length; i++) {
     const randomIndex = Math.floor(Math.random() * characters.length);
@@ -623,7 +623,25 @@ export const verifyAndAddCaregiver = v1.https.onCall(async (data, context) => {
       return { message: "code expired" };
     }
 
-    // Step 4: Code is valid, add caregiver entry
+    // Step 4: Check if a caregiver with the given caregiverId and parentId already exists
+    const existingCaregiverSnapshot = await db
+      .ref("caregiver")
+      .orderByChild("caregiver_id")
+      .equalTo(caregiverId)
+      .once("value");
+
+    if (existingCaregiverSnapshot.exists()) {
+      const caregivers = existingCaregiverSnapshot.val();
+      for (const key in caregivers) {
+        const caregiver = caregivers[key];
+        if (caregiver.parent_id === inviteData.parentId) {
+          // If caregiver with the same caregiverId and parentId exists, return a message
+          return { message: "caregiver already exists" };
+        }
+      }
+    }
+
+    // Step 5: Code is valid, add caregiver entry
     const caregiverRef = db.ref("caregiver").push();
     await caregiverRef.set({
       caregiver_id: caregiverId,
