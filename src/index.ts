@@ -126,9 +126,8 @@ function checkForOutStandingNotifications() {
 const checkEventDoses = async () => {
   const currentTime = Date.now();
   const startOfMinute = getStartOfMinute(currentTime);
-  const endOfMinute = getEndOfMinute(currentTime); // End of current minute
+  const endOfMinute = getEndOfMinute(currentTime);
 
-  // Query for doses that are due within the current minute and have the state "active"
   const snapshot = await db
     .ref("events")
     .orderByChild("nextScheduledDose")
@@ -137,46 +136,59 @@ const checkEventDoses = async () => {
     .once("value");
 
   const promises: Promise<any>[] = [];
-  console.log(
-    "checkEventDose startOfMinute/endOfMinute",
-    startOfMinute,
-    endOfMinute
-  );
 
   snapshot.forEach((childSnapshot) => {
     const event = childSnapshot.val();
-    const eventId = childSnapshot.key; // Get the event ID
+    const eventId = childSnapshot.key;
     if (event.state === "active" && !event.nextNotificationTime) {
-      console.log(
-        `Processing dose for childId: ${event.childId} due at ${event.nextScheduledDose}`
-      );
-
       const promise = getChild(event.childId)
         .then((child) => {
           if (!child) {
             throw new Error(`Child not found for ID ${event.childId}`);
           }
-          return getUser(child.parentId).then((parent) => {
+          return getUser(child.parentId).then(async (parent) => {
             if (!parent) {
               throw new Error(`Parent not found for ID ${child.parentId}`);
             }
-            const parentPushToken = parent?.pushToken;
-            if (!parentPushToken) {
-              throw new Error(`No pushToken for parent with ID ${parent.uid}`);
+
+            // Prepare notification message
+            const notificationBody = `${
+              child.childName
+            } can get the next ${capitalizeFirstLetter(
+              event.cycle
+            )} dose now. Tap to give the dose.`;
+
+            // Fetch care family members
+            const careFamilyMembers = await fetchCareFamilyMembers(
+              child.parentId,
+              event.childId
+            );
+            const eligibleMembers = careFamilyMembers.filter(
+              (member) => member.allowsPushNotifications
+            );
+
+            // Send notification to parent if they allow push notifications
+            if (parent.allowsPushNotifications) {
+              await sendPushNotificationsToUser(parent.uid, notificationBody, {
+                childId: event.childId,
+                eventId: eventId,
+              });
             }
-            return sendPushNotificationsToUser(
-              parent.uid,
-              `${child.childName} can get the next ${capitalizeFirstLetter(
-                event.cycle
-              )} dose now. Tap to give the dose.`,
-              { childId: event.childId, eventId: eventId }
-            ).then(() => {
-              // Update nextNotificationTime after successfully sending the notification
-              const nextNotificationTime = currentTime + 10 * 60 * 1000; // Add 10 minutes
-              return db
-                .ref(`events/${childSnapshot.key}`)
-                .update({ nextNotificationTime, notificationCount: 1 });
-            });
+
+            // Send notifications to eligible care family members
+            const memberPromises = eligibleMembers.map((member) =>
+              sendPushNotificationsToUser(member.uid, notificationBody, {
+                childId: event.childId,
+                eventId: eventId,
+              })
+            );
+            await Promise.all(memberPromises);
+
+            // Update nextNotificationTime and notificationCount
+            const nextNotificationTime = currentTime + 10 * 60 * 1000; // Add 10 minutes
+            return db
+              .ref(`events/${childSnapshot.key}`)
+              .update({ nextNotificationTime, notificationCount: 1 });
           });
         })
         .catch((error) => {
@@ -198,9 +210,8 @@ const checkEventDoses = async () => {
 const checkNextNotificationTime = async () => {
   const currentTime = Date.now();
   const startOfMinute = getStartOfMinute(currentTime);
-  const endOfMinute = getEndOfMinute(currentTime); // End of current minute
+  const endOfMinute = getEndOfMinute(currentTime);
 
-  // Query for doses that are due within the current minute and have the state "active"
   const snapshot = await db
     .ref("events")
     .orderByChild("nextNotificationTime")
@@ -212,107 +223,54 @@ const checkNextNotificationTime = async () => {
 
   snapshot.forEach((childSnapshot) => {
     const event = childSnapshot.val();
-    const eventId = childSnapshot.key; // Get the event ID
+    const eventId = childSnapshot.key;
     if (
       event.state === "active" &&
       event.nextNotificationTime &&
       event.notificationCount <= 5
     ) {
-      console.log(
-        `Processing dose for childId: ${event.childId} due at ${event.nextScheduledDose}`
-      );
-
       const promise = getChild(event.childId)
         .then((child) => {
-          if (!child) {
+          if (!child)
             throw new Error(`Child not found for ID ${event.childId}`);
-          }
-          return getUser(child.parentId).then((parent) => {
-            if (!parent) {
+          return getUser(child.parentId).then(async (parent) => {
+            if (!parent)
               throw new Error(`Parent not found for ID ${child.parentId}`);
-            }
-            const parentPushToken = parent?.pushToken;
-            if (!parentPushToken) {
-              throw new Error(`No pushToken for parent with ID ${parent.uid}`);
-            }
-            let notificationBody: string;
-            switch (event.notificationCount) {
-              case 1:
-                notificationBody = `2nd reminder: ${
-                  child.childName
-                }'s ${capitalizeFirstLetter(event.cycle)} dose is available.`;
-                break;
-              case 2:
-                notificationBody = `3rd reminder: ${
-                  child.childName
-                }'s ${capitalizeFirstLetter(event.cycle)} dose is available.`;
-                break;
-              case 3:
-                notificationBody = `4th reminder: ${
-                  child.childName
-                }'s ${capitalizeFirstLetter(event.cycle)} dose is available.`;
-                break;
-              case 4:
-                notificationBody = `${
-                  child.childName
-                }'s ${capitalizeFirstLetter(
-                  event.cycle
-                )} episode is now paused. Tap to resume.`;
-                break;
-                notificationBody = `${
-                  child.childName
-                } can get the next ${capitalizeFirstLetter(
-                  event.cycle
-                )} dose now`;
-              default:
-                break;
-            }
-            return sendPushNotificationsToUser(parent.uid, notificationBody, {
-              childId: event.childId,
-              eventId: eventId,
-            }).then(() => {
-              // Update nextNotificationTime after successfully sending the notification
-              let nextNotificationTime: number;
-              // event.snoozeInterval set in app on snooze on mark dose
-              switch (event.notificationCount) {
-                case 1:
-                  nextNotificationTime = event.snoozeInterval
-                    ? currentTime + event.snoozeInterval * 60 * 1000
-                    : currentTime + 10 * 60 * 1000; // add 10 min
-                  break;
-                case 2:
-                  nextNotificationTime = event.snoozeInterval
-                    ? currentTime + event.snoozeInterval * 60 * 1000
-                    : currentTime + 25 * 60 * 1000; // add 10 min
-                  break;
-                case 3:
-                  nextNotificationTime = event.snoozeInterval
-                    ? currentTime + event.snoozeInterval * 60 * 1000
-                    : currentTime + 15 * 60 * 1000; // add 25 min
-                  break;
-                case 4:
-                  nextNotificationTime = event.snoozeInterval
-                    ? currentTime + event.snoozeInterval * 60 * 1000
-                    : currentTime + 15 * 60 * 1000; // add 15 min
-                  break;
-                default:
-                  break;
-              }
-              const notificationCount = event.notificationCount + 1;
 
-              if (notificationCount === 5) {
-                return db.ref(`events/${childSnapshot.key}`).update({
-                  state: "paused",
-                  nextNotificationTime: null,
-                  notificationCount: null,
-                  snoozeInterval: null,
-                });
-              } else {
-                return db
-                  .ref(`events/${childSnapshot.key}`)
-                  .update({ nextNotificationTime, notificationCount });
-              }
-            });
+            // Fetch care family members
+            const careFamilyMembers = await fetchCareFamilyMembers(
+              child.parentId,
+              event.childId
+            );
+            const eligibleMembers = careFamilyMembers.filter(
+              (member) => member.allowsPushNotifications
+            );
+
+            // Send notification to parent if they allow push notifications
+            const notificationBody = getNotificationMessage(child, event);
+
+            if (parent.allowsPushNotifications) {
+              await sendPushNotificationsToUser(parent.uid, notificationBody, {
+                childId: event.childId,
+                eventId: eventId,
+              });
+            }
+
+            // Send notification to eligible care family members
+            const memberPromises = eligibleMembers.map((member) =>
+              sendPushNotificationsToUser(member.uid, notificationBody, {
+                childId: event.childId,
+                eventId: eventId,
+              })
+            );
+            await Promise.all(memberPromises);
+
+            // Update next notification time after sending
+            return updateEventNotificationCount(
+              event,
+              childSnapshot.key,
+              currentTime
+            );
           });
         })
         .catch((error) => {
@@ -329,6 +287,102 @@ const checkNextNotificationTime = async () => {
   await Promise.all(promises);
 
   return null;
+};
+
+function getNotificationMessage(child: any, event: any): string {
+  const notificationCount = event.notificationCount;
+  const cycle = capitalizeFirstLetter(event.cycle);
+  const childName = child.childName;
+  switch (notificationCount) {
+    case 1:
+      return `2nd reminder: ${childName}'s ${cycle} dose is available.`;
+    case 2:
+      return `3rd reminder: ${childName}'s ${cycle} dose is available.`;
+    case 3:
+      return `4th reminder: ${childName}'s ${cycle} dose is available.`;
+    case 4:
+      return `${childName}'s ${cycle} episode is now paused. Tap to resume.`;
+    default:
+      return `${childName} can get the next ${cycle} dose now.`;
+  }
+}
+
+function updateEventNotificationCount(
+  event: any,
+  eventId: string,
+  currentTime: number
+) {
+  let nextNotificationTime: number;
+  // Calculate next notification time based on notification count and snoozeInterval
+  switch (event.notificationCount) {
+    case 1:
+      nextNotificationTime =
+        currentTime + (event.snoozeInterval || 10) * 60 * 1000;
+      break;
+    case 2:
+      nextNotificationTime =
+        currentTime + (event.snoozeInterval || 25) * 60 * 1000;
+      break;
+    case 3:
+      nextNotificationTime =
+        currentTime + (event.snoozeInterval || 15) * 60 * 1000;
+      break;
+    case 4:
+      nextNotificationTime =
+        currentTime + (event.snoozeInterval || 15) * 60 * 1000;
+      break;
+  }
+  const newNotificationCount = event.notificationCount + 1;
+  const updates =
+    newNotificationCount === 5
+      ? {
+          state: "paused",
+          nextNotificationTime: null,
+          notificationCount: null,
+          snoozeInterval: null,
+        }
+      : { nextNotificationTime, notificationCount: newNotificationCount };
+
+  return db.ref(`events/${eventId}`).update(updates);
+}
+
+const fetchCareFamilyMembers = async (parentId: string, childID: string) => {
+  try {
+    const careFamilySnapshot = await db
+      .ref("caregiver")
+      .orderByChild("parent_id")
+      .equalTo(parentId)
+      .once("value");
+
+    const careFamilyMembers = [];
+    careFamilySnapshot.forEach((snapshot) => {
+      const memberData = snapshot.val();
+      // Only add caregiver if their `childs` array contains the specified `childID`
+      if (memberData.children && memberData.children.includes(childID)) {
+        careFamilyMembers.push(memberData);
+      }
+    });
+
+    const caregiverPromises = careFamilyMembers.map(async (caregiver) => {
+      const caregiverData = await db
+        .ref(`users/${caregiver.caregiver_id}`)
+        .once("value");
+
+      const caregiverDetails = caregiverData.val();
+      return caregiverDetails && caregiverDetails.allowsPushNotifications
+        ? caregiverDetails
+        : null;
+    });
+
+    const validCaregivers = (await Promise.all(caregiverPromises)).filter(
+      Boolean
+    );
+
+    return validCaregivers; // Return caregivers with allowsPushNotifications === true
+  } catch (error) {
+    console.error("Error fetching care family members:", error);
+    return [];
+  }
 };
 
 function getChild(childId) {
@@ -433,6 +487,32 @@ const getEndOfMinute = (epochTime: number): number => {
 
 const capitalizeFirstLetter = (str: string): string => {
   return str?.charAt(0)?.toUpperCase() + str?.slice(1);
+};
+
+const getCareFamilyName = async (parentId: string): Promise<string> => {
+  try {
+    const existingCaregiverSnapshot = await db
+      .ref("caregiver")
+      .orderByChild("parent_id")
+      .equalTo(parentId)
+      .once("value");
+
+    if (existingCaregiverSnapshot.exists()) {
+      const caregivers = existingCaregiverSnapshot.val();
+      // If there is at least one caregiver with `familyName`, use it as the careFamily name
+      const caregiverWithFamily: any = Object.values(caregivers).find(
+        (caregiver: any) => caregiver.familyName
+      );
+      return caregiverWithFamily?.familyName || "Our Care Family";
+    }
+    return "Our Care Family"; // Default name if no familyName exists
+  } catch (error) {
+    console.error("getCareFamilyName Error", error);
+    throw new v1.https.HttpsError(
+      "internal",
+      "Unable to retrieve family name."
+    );
+  }
 };
 
 // *********************************************** https ************************************************************
@@ -641,6 +721,8 @@ export const verifyAndAddCaregiver = v1.https.onCall(async (data, context) => {
       }
     }
 
+    const familyName = await getCareFamilyName(inviteData.parentId);
+
     // Step 5: Code is valid, add caregiver entry
     const caregiverRef = db.ref("caregiver").push();
     await caregiverRef.set({
@@ -649,6 +731,7 @@ export const verifyAndAddCaregiver = v1.https.onCall(async (data, context) => {
       guardian: false,
       parent_id: inviteData.parentId,
       id: caregiverRef.key,
+      familyName,
     });
 
     //remove code
@@ -702,3 +785,50 @@ const sendPushAfterInviteAccept = async (parentId: string, userName) => {
     );
   }
 };
+
+export const updateCareFamilyName = v1.https.onCall(async (data, context) => {
+  const { parentId, familyName } = data;
+
+  if (!parentId || !familyName) {
+    throw new v1.https.HttpsError(
+      "invalid-argument",
+      "Parent ID and family name must be provided."
+    );
+  }
+
+  try {
+    // Step 1: Retrieve caregivers with the matching parentId
+    const caregiversSnapshot = await db
+      .ref("caregiver")
+      .orderByChild("parent_id")
+      .equalTo(parentId)
+      .once("value");
+
+    if (!caregiversSnapshot.exists()) {
+      return { message: "No caregivers found with the given parent ID." };
+    }
+
+    // Step 2: Prepare updates for each caregiver
+    const updates: Record<string, any> = {};
+    caregiversSnapshot.forEach((snapshot) => {
+      const caregiverKey = snapshot.key;
+
+      // Update familyName if it exists, or add it if not present
+      updates[`caregiver/${caregiverKey}/familyName`] = familyName;
+    });
+
+    // Step 3: Apply the updates to the database
+    await db.ref().update(updates);
+
+    return {
+      message: "Family name updated successfully for all caregivers.",
+      code: "SUCCESS",
+    };
+  } catch (error) {
+    console.error("Error updating care family name:", error);
+    throw new v1.https.HttpsError(
+      "internal",
+      "An error occurred while updating the care family name."
+    );
+  }
+});
