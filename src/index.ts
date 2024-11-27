@@ -832,3 +832,120 @@ export const updateCareFamilyName = v1.https.onCall(async (data, context) => {
     );
   }
 });
+
+export const addPrescriptionAndEvent = v1.https.onCall(
+  async (data, context) => {
+    const { prescription, pastDoses } = data;
+
+    if (!prescription || !prescription.childId || !prescription.parentId) {
+      throw new v1.https.HttpsError(
+        "invalid-argument",
+        "Prescription data must include childId and parentId."
+      );
+    }
+
+    try {
+      // Step 1: Add the prescription
+      const prescriptionRef = db.ref("prescription").push();
+      const prescriptionId = prescriptionRef.key;
+
+      if (!prescriptionId) {
+        throw new v1.https.HttpsError(
+          "internal",
+          "Failed to generate a prescription ID."
+        );
+      }
+
+      const prescriptionWithId = {
+        ...prescription,
+        id: prescriptionId,
+      };
+
+      // Save prescription
+      const savePrescription = prescriptionRef.set(prescriptionWithId);
+
+      // Step 2: Add the prescription event
+      const prescriptionEventsRef = db.ref("prescription_events").push();
+      const prescriptionEventId = prescriptionEventsRef.key;
+
+      if (!prescriptionEventId) {
+        throw new v1.https.HttpsError(
+          "internal",
+          "Failed to generate a prescription event ID."
+        );
+      }
+
+      const prescriptionEventData = {
+        childId: prescription.childId,
+        prescriptionId,
+        createDate: prescription.dateAdded,
+        startDate: prescription.startDate,
+        state: "active",
+        eventId: prescriptionEventId,
+      };
+
+      // Save prescription event
+      const savePrescriptionEvent = prescriptionEventsRef.set(
+        prescriptionEventData
+      );
+
+      // Step 3: Add individual doses to prescription_doses collection
+      const dosesRef = db.ref("prescription_doses");
+      const doseWrites: Promise<void>[] = (pastDoses || []).map(
+        (dose: Dose) => {
+          const doseRef = dosesRef.push();
+          const doseData: Doses = {
+            id: doseRef.key!,
+            prescriptionEventId,
+            date: dose.date,
+            given: true,
+          };
+
+          return doseRef.set(doseData);
+        }
+      );
+
+      // Step 4: Wait for all writes to complete
+      await Promise.all([
+        savePrescription,
+        savePrescriptionEvent,
+        ...doseWrites,
+      ]);
+
+      return {
+        message: "Prescription, events, and doses added successfully",
+        prescriptionId,
+        prescriptionEventId,
+        status: "OK",
+      };
+    } catch (error) {
+      console.error("Error adding prescription and events:", error);
+      throw new v1.https.HttpsError(
+        "internal",
+        "An error occurred while processing the request."
+      );
+    }
+  }
+);
+
+export type Doses = {
+  id: string;
+  prescriptionEventId: string;
+  date: number;
+  givenBy?: GivenBy;
+  given?: boolean;
+  notes?: string | null;
+  adminSite?: string | null;
+  adminSiteDetails?: string | null;
+};
+
+type GivenBy = {
+  uid?: string;
+  name?: string;
+  userPhotoURL?: string;
+};
+
+type Dose = {
+  date: number;
+  givenBy?: GivenBy;
+};
