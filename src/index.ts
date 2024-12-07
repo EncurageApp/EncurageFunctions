@@ -896,9 +896,11 @@ export const addPrescriptionAndEvent = v1.https.onCall(
           const doseRef = dosesRef.push();
           const doseData: Doses = {
             id: doseRef.key!,
+            name: prescription.name,
             prescriptionEventId,
             date: dose.date,
             given: true,
+            dose: prescription.dose,
           };
 
           return doseRef.set(doseData);
@@ -930,6 +932,7 @@ export const addPrescriptionAndEvent = v1.https.onCall(
 
 export type Doses = {
   id: string;
+  name: string;
   prescriptionEventId: string;
   date: number;
   givenBy?: GivenBy;
@@ -937,6 +940,7 @@ export type Doses = {
   notes?: string | null;
   adminSite?: string | null;
   adminSiteDetails?: string | null;
+  dose?: any;
 };
 
 type GivenBy = {
