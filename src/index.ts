@@ -835,7 +835,7 @@ export const updateCareFamilyName = v1.https.onCall(async (data, context) => {
 
 export const addPrescriptionAndEvent = v1.https.onCall(
   async (data, context) => {
-    const { prescription, pastDoses } = data;
+    const { prescription, pastDoses, nextScheduledDose } = data;
 
     if (!prescription || !prescription.childId || !prescription.parentId) {
       throw new v1.https.HttpsError(
@@ -882,6 +882,7 @@ export const addPrescriptionAndEvent = v1.https.onCall(
         startDate: prescription.startDate,
         state: "active",
         eventId: prescriptionEventId,
+        nextScheduledDose: nextScheduledDose,
       };
 
       // Save prescription event
