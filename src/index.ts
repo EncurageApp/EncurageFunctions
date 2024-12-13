@@ -18,11 +18,6 @@ const db = admin.database();
 // Start writing functions
 // https://firebase.google.com/docs/functions/typescript
 
-// export const helloWorld = v1.https.onRequest((request, response) => {
-//   logger.info('Hello logs!', { structuredData: true });
-//   response.send('Hello from Firebase!');
-// });
-
 export const newChildAdded = v1.database
   .ref("children/{childId}")
   .onCreate(async (snapshot, context) => {
@@ -109,13 +104,26 @@ function checkForOutStandingNotifications() {
   return Promise.all([
     checkEventDoses().catch((error) => {
       // Catch any error that occurs so we do not stop the prescription notifications
-      logger.error("An error occurred in checkForEventNotifications()", error);
+      logger.error("An error occurred in checkForEventNotifications", error);
       return error;
     }),
     checkNextNotificationTime().catch((error) => {
       // Catch any error that occurs so we do not stop the event notifications
       logger.error(
-        "An error occurred in checkForPrescriptionNotifications()",
+        "An error occurred in checkForPrescriptionNotifications",
+        error
+      );
+      return error;
+    }),
+    processPrescriptionEvents().catch((error) => {
+      // Catch any error that occurs so we do not stop the event notifications
+      logger.error("An error occurred in processPrescriptionEvents", error);
+      return error;
+    }),
+    processPrescriptionNextNotificationTime().catch((error) => {
+      // Catch any error that occurs so we do not stop the event notifications
+      logger.error(
+        "An error occurred in processPrescriptionNextNotificationTime",
         error
       );
       return error;
@@ -233,6 +241,7 @@ const checkNextNotificationTime = async () => {
         .then((child) => {
           if (!child)
             throw new Error(`Child not found for ID ${event.childId}`);
+
           return getUser(child.parentId).then(async (parent) => {
             if (!parent)
               throw new Error(`Parent not found for ID ${child.parentId}`);
@@ -289,6 +298,185 @@ const checkNextNotificationTime = async () => {
   return null;
 };
 
+const processPrescriptionEvents = async () => {
+  const currentTime = Date.now();
+  const startOfMinute = getStartOfMinute(currentTime);
+  const endOfMinute = getEndOfMinute(currentTime);
+
+  const snapshot = await db
+    .ref("prescription_events")
+    .orderByChild("nextScheduledDose")
+    .startAt(startOfMinute)
+    .endAt(endOfMinute)
+    .once("value");
+
+  const promises: Promise<any>[] = [];
+
+  snapshot.forEach((childSnapshot) => {
+    const event = childSnapshot.val();
+    const eventId = childSnapshot.key;
+
+    if (event.state === "active" && !event.nextNotificationTime) {
+      const promise = getChild(event.childId)
+        .then((child) => {
+          if (!child) {
+            throw new Error(`Child not found for ID ${event.childId}`);
+          }
+          return getUser(child.parentId).then(async (parent) => {
+            if (!parent) {
+              throw new Error(`Parent not found for ID ${child.parentId}`);
+            }
+
+            const prescription = await getPrescription(event.prescriptionId);
+
+            // Prepare notification message
+            const notificationBody = `It's time for ${
+              child.childName
+            }'s next dose of ${capitalizeFirstLetter(
+              prescription.name
+            )}. Tap to give the dose.`;
+
+            // Fetch care team members
+            const careFamilyMembers = await fetchCareFamilyMembers(
+              child.parentId,
+              event.childId
+            );
+            const eligibleMembers = careFamilyMembers.filter(
+              (member) => member.allowsPushNotifications
+            );
+
+            // Send notification to caregiver if they allow push notifications
+            if (parent.allowsPushNotifications) {
+              await sendPushNotificationsToUser(parent.uid, notificationBody, {
+                childId: event.childId,
+                eventId: eventId,
+              });
+            }
+
+            // Send notifications to eligible care team members
+            const memberPromises = eligibleMembers.map((member) =>
+              sendPushNotificationsToUser(member.uid, notificationBody, {
+                childId: event.childId,
+                eventId: eventId,
+              })
+            );
+            await Promise.all(memberPromises);
+
+            // Update nextNotificationTime and notificationCount
+            const nextNotificationTime = currentTime + 10 * 60 * 1000; // Add 10 minutes
+            return db
+              .ref(`prescription_events/${childSnapshot.key}`)
+              .update({ nextNotificationTime, notificationCount: 1 });
+          });
+        })
+        .catch((error) => {
+          console.error(
+            `Error processing prescription dose for child: ${event.childId}`,
+            error
+          );
+        });
+
+      promises.push(promise);
+    }
+  });
+
+  await Promise.all(promises);
+
+  return null;
+};
+
+const processPrescriptionNextNotificationTime = async () => {
+  const currentTime = Date.now();
+  const startOfMinute = getStartOfMinute(currentTime);
+  const endOfMinute = getEndOfMinute(currentTime);
+
+  const snapshot = await db
+    .ref("prescription_events")
+    .orderByChild("nextNotificationTime")
+    .startAt(startOfMinute)
+    .endAt(endOfMinute)
+    .once("value");
+
+  const promises: Promise<any>[] = [];
+
+  snapshot.forEach((childSnapshot) => {
+    const event = childSnapshot.val();
+    const eventId = childSnapshot.key;
+    if (
+      event.state === "active" &&
+      event.nextNotificationTime &&
+      event.notificationCount <= 5
+    ) {
+      const promise = getChild(event.childId)
+        .then((child) => {
+          if (!child)
+            throw new Error(`Child not found for ID ${event.childId}`);
+
+          return getUser(child.parentId).then(async (parent) => {
+            if (!parent)
+              throw new Error(`Parent not found for ID ${child.parentId}`);
+
+            // Fetch care family members
+            const careFamilyMembers = await fetchCareFamilyMembers(
+              child.parentId,
+              event.childId
+            );
+
+            const eligibleMembers = careFamilyMembers.filter(
+              (member) => member.allowsPushNotifications
+            );
+
+            const prescription = await getPrescription(event.prescriptionId);
+
+            // Send notification to parent if they allow push notifications
+            const notificationBody = prescriptionNotification(
+              child.childName,
+              event.notificationCount,
+              prescription.name
+            );
+
+            if (parent.allowsPushNotifications) {
+              await sendPushNotificationsToUser(parent.uid, notificationBody, {
+                childId: event.childId,
+                eventId: eventId,
+              });
+            }
+
+            // Send notification to eligible care family members
+            const memberPromises = eligibleMembers.map((member) =>
+              sendPushNotificationsToUser(member.uid, notificationBody, {
+                childId: event.childId,
+                eventId: eventId,
+              })
+            );
+            await Promise.all(memberPromises);
+
+            // Update next notification time after sending
+            return updatePrescriptionEventNotificationCount(
+              event,
+              eventId,
+              currentTime,
+              prescription,
+              parent.timeZone
+            );
+          });
+        })
+        .catch((error) => {
+          console.error(
+            `Error processing dose for childId: ${event.childId}`,
+            error
+          );
+        });
+
+      promises.push(promise);
+    }
+  });
+
+  await Promise.all(promises);
+
+  return null;
+};
+
 function getNotificationMessage(child: any, event: any): string {
   const notificationCount = event.notificationCount;
   const cycle = capitalizeFirstLetter(event.cycle);
@@ -304,6 +492,27 @@ function getNotificationMessage(child: any, event: any): string {
       return `${childName}'s ${cycle} episode is now paused. Tap to resume.`;
     default:
       return `${childName} can get the next ${cycle} dose now.`;
+  }
+}
+
+function prescriptionNotification(
+  childName: string,
+  notificationCount: any,
+  prescriptionName: any
+): string {
+  const medName = capitalizeFirstLetter(prescriptionName);
+
+  switch (notificationCount) {
+    case 1:
+      return `${childName}'s ${medName} dose is due. Tap to give the dose.`;
+    case 2:
+      return `${childName}'s ${medName} dose is due. Tap to give the dose.`;
+    case 3:
+      return `${childName}'s ${medName} dose is due. Tap to give the dose.`;
+    case 4:
+      return `${childName}'s ${medName} dose was missed. Tap to choose how to proceed`;
+    default:
+      return `${childName} can get the next ${medName} dose now.`;
   }
 }
 
@@ -333,6 +542,7 @@ function updateEventNotificationCount(
       break;
   }
   const newNotificationCount = event.notificationCount + 1;
+
   const updates =
     newNotificationCount === 5
       ? {
@@ -344,6 +554,72 @@ function updateEventNotificationCount(
       : { nextNotificationTime, notificationCount: newNotificationCount };
 
   return db.ref(`events/${eventId}`).update(updates);
+}
+
+function updatePrescriptionEventNotificationCount(
+  event: any,
+  eventId: string,
+  currentTime: number,
+  prescription: any,
+  timeZone: string
+) {
+  let nextNotificationTime: number;
+  // Calculate next notification time based on notification count and snoozeInterval
+  switch (event.notificationCount) {
+    case 1:
+      nextNotificationTime =
+        currentTime + (event.snoozeInterval || 10) * 60 * 1000;
+      break;
+    case 2:
+      nextNotificationTime =
+        currentTime + (event.snoozeInterval || 25) * 60 * 1000;
+      break;
+    case 3:
+      nextNotificationTime =
+        currentTime + (event.snoozeInterval || 15) * 60 * 1000;
+      break;
+    case 4:
+      nextNotificationTime =
+        currentTime + (event.snoozeInterval || 15) * 60 * 1000;
+      break;
+  }
+
+  const newNotificationCount = event.notificationCount + 1;
+  const updates: Partial<{
+    state: string;
+    nextNotificationTime: number | null;
+    notificationCount: number | null;
+    snoozeInterval: number | null;
+    nextScheduledDose: any;
+  }> =
+    newNotificationCount === 5
+      ? {
+          nextNotificationTime: null,
+          notificationCount: null,
+          snoozeInterval: null,
+        }
+      : { nextNotificationTime, notificationCount: newNotificationCount };
+
+  if (newNotificationCount === 5) {
+    // Add a new dose to the "prescription_doses" collection
+    const newDoseRef = db.ref("prescription_doses").push();
+    const dose = {
+      id: newDoseRef.key,
+      prescriptionEventId: eventId,
+      date: event.nextScheduledDose,
+      given: false,
+      frequencyType: prescription.frequency,
+      name: prescription.name,
+      dose: prescription.dose,
+    };
+    newDoseRef.set(dose);
+
+    // Update the event with a new nextScheduledDose time
+    const nextScheduledDose = calculateNextDose(prescription, timeZone);
+    updates.nextScheduledDose = nextScheduledDose;
+  }
+
+  return db.ref(`prescription_events/${eventId}`).update(updates);
 }
 
 const fetchCareFamilyMembers = async (parentId: string, childID: string) => {
@@ -476,6 +752,25 @@ function sendPushNotificationsToUser(
     });
 }
 
+const getPrescription = async (prescriptionId: string) => {
+  try {
+    const snapshot = await db
+      .ref(`prescription/${prescriptionId}`)
+      .once("value");
+    const prescription = snapshot.val();
+    if (!prescription) {
+      throw new Error(`Prescription not found for ID ${prescriptionId}`);
+    }
+    return prescription;
+  } catch (error) {
+    console.error(
+      `Error fetching prescription for ID ${prescriptionId}:`,
+      error
+    );
+    throw error;
+  }
+};
+
 const getStartOfMinute = (epochTime: number): number => {
   return epochTime - (epochTime % 60000);
 };
@@ -514,6 +809,182 @@ const getCareFamilyName = async (parentId: string): Promise<string> => {
     );
   }
 };
+
+enum FrequencyInterval {
+  HOURLY = "hourly", // ok
+  DAILY = "daily", // ok
+  EVERY_OTHER_DAY = "every_other_day",
+  WEEKLY = "weekly", // ok
+  ONCE_A_WEEKLY = "once_a_week",
+  CERTAIN_DAYS = "certain_days", // ok // For specifying particular days of the week
+  MONTHLY = "monthly", // ok
+  CUSTOM = "custom", // For any custom frequency that doesn't fit above types
+}
+
+function calculateNextDose(prescription: any, userTimeZone: string): number {
+  const { frequency, startDate, reminderTimes } = prescription || {};
+  const currentTime = Date.now();
+
+  // Adjust currentTime to user's local timezone
+  const localCurrentTime = adjustToTimeZone(currentTime, userTimeZone);
+
+  // Ensure nextDose is at least `startDate` and after the localCurrentTime
+  let nextDose = Math.max(startDate, localCurrentTime);
+  switch (frequency?.type) {
+    case FrequencyInterval.HOURLY:
+      if (!frequency?.interval) {
+        throw new Error("Frequency interval is required for HOURLY type.");
+      }
+      const hourlyInterval = frequency.interval * 60 * 60 * 1000; // Convert hours to ms
+      nextDose = startDate; // Start from the given startDate
+
+      while (nextDose <= localCurrentTime) {
+        nextDose += hourlyInterval;
+      }
+      break;
+
+    case FrequencyInterval.DAILY:
+      if (
+        !frequency?.interval ||
+        !reminderTimes ||
+        reminderTimes.length === 0
+      ) {
+        throw new Error(
+          "Frequency interval and reminderTimes are required for DAILY type."
+        );
+      }
+
+      const dailyStart = Math.max(startDate, localCurrentTime);
+      let searchDate = new Date(adjustToTimeZone(dailyStart, userTimeZone)); // Adjust to timezone
+
+      while (true) {
+        const dayMidnight = new Date(
+          searchDate.getFullYear(),
+          searchDate.getMonth(),
+          searchDate.getDate(),
+          0,
+          0,
+          0,
+          0
+        ).getTime();
+
+        for (const reminderTime of reminderTimes) {
+          const potentialDose = dayMidnight + reminderTime;
+          if (potentialDose > localCurrentTime && potentialDose >= startDate) {
+            nextDose = potentialDose;
+            break;
+          }
+        }
+
+        if (nextDose > localCurrentTime) {
+          break;
+        }
+
+        searchDate = new Date(
+          adjustToTimeZone(dayMidnight + 24 * 60 * 60 * 1000, userTimeZone)
+        );
+      }
+      break;
+
+    case FrequencyInterval.WEEKLY:
+      if (
+        !frequency?.interval ||
+        !reminderTimes ||
+        reminderTimes.length === 0
+      ) {
+        throw new Error(
+          "Frequency interval and reminderTimes are required for WEEKLY type."
+        );
+      }
+
+      const weeklyInterval = frequency.interval * 7 * 24 * 60 * 60 * 1000; // weeks in ms
+      let weeklyTime = adjustToTimeZone(
+        startDate + reminderTimes[0],
+        userTimeZone
+      ); // Adjust to timezone
+
+      while (weeklyTime <= localCurrentTime) {
+        weeklyTime += weeklyInterval;
+      }
+
+      nextDose = weeklyTime;
+      break;
+
+    case FrequencyInterval.CERTAIN_DAYS:
+      if (!frequency?.daysOfWeek || frequency?.daysOfWeek.length === 0) {
+        throw new Error("Days of the week are required for CERTAIN_DAYS type.");
+      }
+      if (!reminderTimes || reminderTimes.length === 0) {
+        throw new Error("Reminder times are required for CERTAIN_DAYS type.");
+      }
+
+      let searchTime = Math.max(startDate, localCurrentTime);
+
+      while (true) {
+        const searchDateObj = new Date(
+          adjustToTimeZone(searchTime, userTimeZone)
+        );
+        const currentDayIndex = searchDateObj.getDay();
+
+        if (frequency.daysOfWeek.includes(currentDayIndex)) {
+          const dayMidnight = new Date(
+            searchDateObj.getFullYear(),
+            searchDateObj.getMonth(),
+            searchDateObj.getDate(),
+            0,
+            0,
+            0,
+            0
+          ).getTime();
+
+          for (const reminderTime of reminderTimes) {
+            const potentialDose = dayMidnight + reminderTime;
+            if (
+              potentialDose > localCurrentTime &&
+              potentialDose >= startDate
+            ) {
+              nextDose = potentialDose;
+              break;
+            }
+          }
+
+          if (nextDose > localCurrentTime) {
+            break;
+          }
+        }
+
+        searchTime += 24 * 60 * 60 * 1000;
+      }
+      break;
+
+    default:
+      throw new Error("Unsupported frequency type.");
+  }
+
+  return nextDose;
+}
+
+function adjustToTimeZone(currentTime: number, timeZone: string): number {
+  const formatter = new Intl.DateTimeFormat("en-US", { timeZone });
+  const parts = formatter.formatToParts(new Date(currentTime));
+  const hours = parseInt(
+    parts.find((p) => p.type === "hour")?.value || "0",
+    10
+  );
+  const minutes = parseInt(
+    parts.find((p) => p.type === "minute")?.value || "0",
+    10
+  );
+  const seconds = parseInt(
+    parts.find((p) => p.type === "second")?.value || "0",
+    10
+  );
+
+  const localTime = new Date(currentTime);
+  localTime.setHours(hours, minutes, seconds, 0);
+
+  return localTime.getTime();
+}
 
 // *********************************************** https ************************************************************
 
