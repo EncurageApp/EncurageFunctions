@@ -201,7 +201,7 @@ const checkEventDoses = async () => {
         })
         .catch((error) => {
           console.error(
-            `Error processing dose for childId: ${event.childId}`,
+            `checkEventDoses Error for childId: ${event.childId}`,
             error
           );
         });
@@ -284,7 +284,7 @@ const checkNextNotificationTime = async () => {
         })
         .catch((error) => {
           console.error(
-            `Error processing dose for childId: ${event.childId}`,
+            `checkNextNotificationTime Error for childId: ${event.childId}`,
             error
           );
         });
@@ -456,8 +456,7 @@ const processPrescriptionNextNotificationTime = async () => {
               event,
               eventId,
               currentTime,
-              prescription,
-              parent.timeZone
+              prescription
             );
           });
         })
@@ -560,8 +559,7 @@ function updatePrescriptionEventNotificationCount(
   event: any,
   eventId: string,
   currentTime: number,
-  prescription: any,
-  timeZone: string
+  prescription: any
 ) {
   let nextNotificationTime: number;
   // Calculate next notification time based on notification count and snoozeInterval
@@ -615,7 +613,7 @@ function updatePrescriptionEventNotificationCount(
     newDoseRef.set(dose);
 
     // Update the event with a new nextScheduledDose time
-    const nextScheduledDose = calculateNextDose(prescription, timeZone);
+    const nextScheduledDose = calculateNextDose(prescription);
     updates.nextScheduledDose = nextScheduledDose;
   }
 
@@ -821,24 +819,23 @@ enum FrequencyInterval {
   CUSTOM = "custom", // For any custom frequency that doesn't fit above types
 }
 
-function calculateNextDose(prescription: any, userTimeZone: string): number {
+export function calculateNextDose(prescription: any): number {
   const { frequency, startDate, reminderTimes } = prescription || {};
   const currentTime = Date.now();
 
-  // Adjust currentTime to user's local timezone
-  const localCurrentTime = adjustToTimeZone(currentTime, userTimeZone);
+  // Ensure nextDose is at least `startDate` and after the current time
+  let nextDose = Math.max(new Date(startDate).getTime(), currentTime);
 
-  // Ensure nextDose is at least `startDate` and after the localCurrentTime
-  let nextDose = Math.max(startDate, localCurrentTime);
   switch (frequency?.type) {
     case FrequencyInterval.HOURLY:
       if (!frequency?.interval) {
         throw new Error("Frequency interval is required for HOURLY type.");
       }
       const hourlyInterval = frequency.interval * 60 * 60 * 1000; // Convert hours to ms
-      nextDose = startDate; // Start from the given startDate
+      nextDose = new Date(startDate).getTime(); // Start from the given startDate
 
-      while (nextDose <= localCurrentTime) {
+      // Increment by the interval until nextDose is after the current time
+      while (nextDose <= currentTime) {
         nextDose += hourlyInterval;
       }
       break;
@@ -854,8 +851,8 @@ function calculateNextDose(prescription: any, userTimeZone: string): number {
         );
       }
 
-      const dailyStart = Math.max(startDate, localCurrentTime);
-      let searchDate = new Date(adjustToTimeZone(dailyStart, userTimeZone)); // Adjust to timezone
+      const dailyStart = Math.max(new Date(startDate).getTime(), currentTime);
+      let searchDate = new Date(dailyStart);
 
       while (true) {
         const dayMidnight = new Date(
@@ -870,19 +867,20 @@ function calculateNextDose(prescription: any, userTimeZone: string): number {
 
         for (const reminderTime of reminderTimes) {
           const potentialDose = dayMidnight + reminderTime;
-          if (potentialDose > localCurrentTime && potentialDose >= startDate) {
+          if (
+            potentialDose > currentTime &&
+            potentialDose >= new Date(startDate).getTime()
+          ) {
             nextDose = potentialDose;
             break;
           }
         }
 
-        if (nextDose > localCurrentTime) {
+        if (nextDose > currentTime) {
           break;
         }
 
-        searchDate = new Date(
-          adjustToTimeZone(dayMidnight + 24 * 60 * 60 * 1000, userTimeZone)
-        );
+        searchDate = new Date(dayMidnight + 24 * 60 * 60 * 1000);
       }
       break;
 
@@ -898,12 +896,9 @@ function calculateNextDose(prescription: any, userTimeZone: string): number {
       }
 
       const weeklyInterval = frequency.interval * 7 * 24 * 60 * 60 * 1000; // weeks in ms
-      let weeklyTime = adjustToTimeZone(
-        startDate + reminderTimes[0],
-        userTimeZone
-      ); // Adjust to timezone
+      let weeklyTime = new Date(startDate).getTime() + reminderTimes[0]; // First dose: startDate + first reminder time
 
-      while (weeklyTime <= localCurrentTime) {
+      while (weeklyTime <= currentTime) {
         weeklyTime += weeklyInterval;
       }
 
@@ -918,12 +913,10 @@ function calculateNextDose(prescription: any, userTimeZone: string): number {
         throw new Error("Reminder times are required for CERTAIN_DAYS type.");
       }
 
-      let searchTime = Math.max(startDate, localCurrentTime);
+      let searchTime = Math.max(new Date(startDate).getTime(), currentTime);
 
       while (true) {
-        const searchDateObj = new Date(
-          adjustToTimeZone(searchTime, userTimeZone)
-        );
+        const searchDateObj = new Date(searchTime);
         const currentDayIndex = searchDateObj.getDay();
 
         if (frequency.daysOfWeek.includes(currentDayIndex)) {
@@ -940,20 +933,89 @@ function calculateNextDose(prescription: any, userTimeZone: string): number {
           for (const reminderTime of reminderTimes) {
             const potentialDose = dayMidnight + reminderTime;
             if (
-              potentialDose > localCurrentTime &&
-              potentialDose >= startDate
+              potentialDose > currentTime &&
+              potentialDose >= new Date(startDate).getTime()
             ) {
               nextDose = potentialDose;
               break;
             }
           }
 
-          if (nextDose > localCurrentTime) {
+          if (nextDose > currentTime) {
             break;
           }
         }
 
-        searchTime += 24 * 60 * 60 * 1000;
+        searchTime += 24 * 60 * 60 * 1000; // Add a day
+      }
+      break;
+
+    case FrequencyInterval.MONTHLY:
+      if (
+        !frequency?.interval ||
+        !reminderTimes ||
+        reminderTimes.length === 0
+      ) {
+        throw new Error(
+          "Months interval and reminderTimes are required for MONTHLY type."
+        );
+      }
+
+      let monthlyTime = new Date(startDate).getTime() + reminderTimes[0]; // First dose: startDate + first reminder time
+
+      while (monthlyTime <= currentTime) {
+        const currentDateObj = new Date(monthlyTime);
+        const nextMonthDate = new Date(
+          currentDateObj.getFullYear(),
+          currentDateObj.getMonth() + frequency.interval,
+          currentDateObj.getDate(),
+          currentDateObj.getHours(),
+          currentDateObj.getMinutes(),
+          currentDateObj.getSeconds()
+        );
+        monthlyTime = nextMonthDate.getTime();
+      }
+
+      nextDose = monthlyTime;
+      break;
+
+    case FrequencyInterval.EVERY_OTHER_DAY:
+      if (!reminderTimes || reminderTimes.length === 0) {
+        throw new Error(
+          "Reminder times are required for EVERY_OTHER_DAY type."
+        );
+      }
+
+      const everyOtherDayInterval = 2 * 24 * 60 * 60 * 1000; // 2 days in ms
+      nextDose = new Date(startDate).getTime();
+
+      while (true) {
+        const nextDoseDate = new Date(nextDose);
+        const dayMidnight = new Date(
+          nextDoseDate.getFullYear(),
+          nextDoseDate.getMonth(),
+          nextDoseDate.getDate(),
+          0,
+          0,
+          0,
+          0
+        ).getTime();
+
+        let foundDose = false;
+        for (const reminderTime of reminderTimes) {
+          const potentialDose = dayMidnight + reminderTime;
+          if (potentialDose > currentTime) {
+            nextDose = potentialDose;
+            foundDose = true;
+            break;
+          }
+        }
+
+        if (foundDose) {
+          break;
+        }
+
+        nextDose += everyOtherDayInterval;
       }
       break;
 
@@ -962,28 +1024,6 @@ function calculateNextDose(prescription: any, userTimeZone: string): number {
   }
 
   return nextDose;
-}
-
-function adjustToTimeZone(currentTime: number, timeZone: string): number {
-  const formatter = new Intl.DateTimeFormat("en-US", { timeZone });
-  const parts = formatter.formatToParts(new Date(currentTime));
-  const hours = parseInt(
-    parts.find((p) => p.type === "hour")?.value || "0",
-    10
-  );
-  const minutes = parseInt(
-    parts.find((p) => p.type === "minute")?.value || "0",
-    10
-  );
-  const seconds = parseInt(
-    parts.find((p) => p.type === "second")?.value || "0",
-    10
-  );
-
-  const localTime = new Date(currentTime);
-  localTime.setHours(hours, minutes, seconds, 0);
-
-  return localTime.getTime();
 }
 
 // *********************************************** https ************************************************************
