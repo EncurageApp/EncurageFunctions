@@ -12,6 +12,8 @@ import * as v1 from "firebase-functions/v1";
 // import * as v2 from "firebase-functions/v2";
 import * as logger from "firebase-functions/logger";
 import * as admin from "firebase-admin";
+import moment from "moment-timezone";
+
 admin.initializeApp();
 const db = admin.database();
 
@@ -456,7 +458,8 @@ const processPrescriptionNextNotificationTime = async () => {
               event,
               eventId,
               currentTime,
-              prescription
+              prescription,
+              parent.timeZone
             );
           });
         })
@@ -559,7 +562,8 @@ function updatePrescriptionEventNotificationCount(
   event: any,
   eventId: string,
   currentTime: number,
-  prescription: any
+  prescription: any,
+  timeZone: string
 ) {
   let nextNotificationTime: number;
   // Calculate next notification time based on notification count and snoozeInterval
@@ -611,10 +615,10 @@ function updatePrescriptionEventNotificationCount(
       dose: prescription.dose,
     };
     newDoseRef.set(dose);
-
     // Update the event with a new nextScheduledDose time
-    const nextScheduledDose = calculateNextDose(prescription);
-    updates.nextScheduledDose = nextScheduledDose;
+    const timeStamp = calculateNextDose(prescription, timeZone);
+    console.log("timeStamp", timeStamp);
+    updates.nextScheduledDose = timeStamp;
   }
 
   return db.ref(`prescription_events/${eventId}`).update(updates);
@@ -819,12 +823,16 @@ enum FrequencyInterval {
   CUSTOM = "custom", // For any custom frequency that doesn't fit above types
 }
 
-export function calculateNextDose(prescription: any): number {
+export function calculateNextDose(prescription: any, timeZone: string): number {
   const { frequency, startDate, reminderTimes } = prescription || {};
-  const currentTime = Date.now();
+  const currentTime = moment.tz(timeZone).valueOf();
+  logger.log("currentTime", currentTime);
 
   // Ensure nextDose is at least `startDate` and after the current time
-  let nextDose = Math.max(new Date(startDate).getTime(), currentTime);
+  let nextDose = Math.max(
+    moment.tz(startDate, timeZone).valueOf(),
+    currentTime
+  );
 
   switch (frequency?.type) {
     case FrequencyInterval.HOURLY:
@@ -855,21 +863,25 @@ export function calculateNextDose(prescription: any): number {
       let searchDate = new Date(dailyStart);
 
       while (true) {
-        const dayMidnight = new Date(
-          searchDate.getFullYear(),
-          searchDate.getMonth(),
-          searchDate.getDate(),
-          0,
-          0,
-          0,
-          0
-        ).getTime();
+        const dayMidnight = moment
+          .tz(
+            {
+              year: searchDate.getFullYear(),
+              month: searchDate.getMonth(), // Month is 0-indexed in both JavaScript Date and moment
+              day: searchDate.getDate(),
+              hour: 0,
+              minute: 0,
+              second: 0,
+            },
+            timeZone
+          )
+          .valueOf(); // Returns the epoch time in milliseconds
 
         for (const reminderTime of reminderTimes) {
           const potentialDose = dayMidnight + reminderTime;
           if (
             potentialDose > currentTime &&
-            potentialDose >= new Date(startDate).getTime()
+            potentialDose >= moment.tz(startDate, timeZone).valueOf()
           ) {
             nextDose = potentialDose;
             break;
@@ -897,7 +909,6 @@ export function calculateNextDose(prescription: any): number {
 
       const weeklyInterval = frequency.interval * 7 * 24 * 60 * 60 * 1000; // weeks in ms
       let weeklyTime = new Date(startDate).getTime() + reminderTimes[0]; // First dose: startDate + first reminder time
-
       while (weeklyTime <= currentTime) {
         weeklyTime += weeklyInterval;
       }
@@ -914,27 +925,30 @@ export function calculateNextDose(prescription: any): number {
       }
 
       let searchTime = Math.max(new Date(startDate).getTime(), currentTime);
-
       while (true) {
         const searchDateObj = new Date(searchTime);
         const currentDayIndex = searchDateObj.getDay();
 
         if (frequency.daysOfWeek.includes(currentDayIndex)) {
-          const dayMidnight = new Date(
-            searchDateObj.getFullYear(),
-            searchDateObj.getMonth(),
-            searchDateObj.getDate(),
-            0,
-            0,
-            0,
-            0
-          ).getTime();
+          const dayMidnight = moment
+            .tz(
+              {
+                year: searchDateObj.getFullYear(),
+                month: searchDateObj.getMonth(),
+                day: searchDateObj.getDate(),
+                hour: 0,
+                minute: 0,
+                second: 0,
+              },
+              timeZone
+            )
+            .valueOf();
 
           for (const reminderTime of reminderTimes) {
             const potentialDose = dayMidnight + reminderTime;
             if (
               potentialDose > currentTime &&
-              potentialDose >= new Date(startDate).getTime()
+              potentialDose >= moment.tz(startDate, timeZone).valueOf()
             ) {
               nextDose = potentialDose;
               break;
@@ -991,15 +1005,19 @@ export function calculateNextDose(prescription: any): number {
 
       while (true) {
         const nextDoseDate = new Date(nextDose);
-        const dayMidnight = new Date(
-          nextDoseDate.getFullYear(),
-          nextDoseDate.getMonth(),
-          nextDoseDate.getDate(),
-          0,
-          0,
-          0,
-          0
-        ).getTime();
+        const dayMidnight = moment
+          .tz(
+            {
+              year: nextDoseDate.getFullYear(),
+              month: nextDoseDate.getMonth(),
+              day: nextDoseDate.getDate(),
+              hour: 0,
+              minute: 0,
+              second: 0,
+            },
+            timeZone
+          )
+          .valueOf();
 
         let foundDose = false;
         for (const reminderTime of reminderTimes) {
@@ -1017,6 +1035,22 @@ export function calculateNextDose(prescription: any): number {
 
         nextDose += everyOtherDayInterval;
       }
+      break;
+    case FrequencyInterval.ONCE_A_WEEKLY:
+      if (!reminderTimes || reminderTimes.length === 0) {
+        throw new Error("Reminder times are required for ONCE_A_WEEKLY type.");
+      }
+
+      // ONCE_A_WEEKLY implies a 1-week interval
+      const onceWeeklyInterval = 7 * 24 * 60 * 60 * 1000; // 7 days in ms
+      let onceWeeklyTime = startDate + reminderTimes[0]; // The first occurrence is startDate + reminderTime
+
+      // If the first occurrence is in the past, move forward week by week until it's in the future
+      while (onceWeeklyTime <= currentTime) {
+        onceWeeklyTime += onceWeeklyInterval;
+      }
+
+      nextDose = onceWeeklyTime;
       break;
 
     default:
