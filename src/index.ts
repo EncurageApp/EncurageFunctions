@@ -512,7 +512,7 @@ function prescriptionNotification(
     case 3:
       return `${childName}'s ${medName} dose is due. Tap to give the dose.`;
     case 4:
-      return `${childName}'s ${medName} dose was missed. Tap to choose how to proceed`;
+      return `${childName}'s ${medName} dose was skipped. Head to the schedule to view or edit.`;
     default:
       return `${childName} can get the next ${medName} dose now.`;
   }
@@ -1445,6 +1445,7 @@ export const addPrescriptionAndEvent = v1.https.onCall(
             name: prescription.name,
             prescriptionEventId,
             date: dose.date,
+            timeGiven: dose.date,
             given: true,
             dose: prescription.dose,
           };
@@ -1483,6 +1484,7 @@ export type Doses = {
   date: number;
   givenBy?: GivenBy;
   given?: boolean;
+  timeGiven?: number;
   notes?: string | null;
   adminSite?: string | null;
   adminSiteDetails?: string | null;
