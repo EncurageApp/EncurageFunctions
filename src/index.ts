@@ -182,6 +182,7 @@ const checkEventDoses = async () => {
               await sendPushNotificationsToUser(parent.uid, notificationBody, {
                 childId: event.childId,
                 eventId: eventId,
+                screen: "EpisodeSchedule",
               });
             }
 
@@ -190,6 +191,7 @@ const checkEventDoses = async () => {
               sendPushNotificationsToUser(member.uid, notificationBody, {
                 childId: event.childId,
                 eventId: eventId,
+                screen: "EpisodeSchedule",
               })
             );
             await Promise.all(memberPromises);
@@ -264,6 +266,7 @@ const checkNextNotificationTime = async () => {
               await sendPushNotificationsToUser(parent.uid, notificationBody, {
                 childId: event.childId,
                 eventId: eventId,
+                screen: "EpisodeSchedule",
               });
             }
 
@@ -272,6 +275,7 @@ const checkNextNotificationTime = async () => {
               sendPushNotificationsToUser(member.uid, notificationBody, {
                 childId: event.childId,
                 eventId: eventId,
+                screen: "EpisodeSchedule",
               })
             );
             await Promise.all(memberPromises);
@@ -352,6 +356,7 @@ const processPrescriptionEvents = async () => {
               await sendPushNotificationsToUser(parent.uid, notificationBody, {
                 childId: event.childId,
                 eventId: eventId,
+                screen: "PrimarySchedule",
               });
             }
 
@@ -360,6 +365,7 @@ const processPrescriptionEvents = async () => {
               sendPushNotificationsToUser(member.uid, notificationBody, {
                 childId: event.childId,
                 eventId: eventId,
+                screen: "PrimarySchedule",
               })
             );
             await Promise.all(memberPromises);
@@ -441,6 +447,7 @@ const processPrescriptionNextNotificationTime = async () => {
               await sendPushNotificationsToUser(parent.uid, notificationBody, {
                 childId: event.childId,
                 eventId: eventId,
+                screen: "PrimarySchedule",
               });
             }
 
@@ -449,6 +456,7 @@ const processPrescriptionNextNotificationTime = async () => {
               sendPushNotificationsToUser(member.uid, notificationBody, {
                 childId: event.childId,
                 eventId: eventId,
+                screen: "PrimarySchedule",
               })
             );
             await Promise.all(memberPromises);
@@ -1313,7 +1321,8 @@ const sendPushAfterInviteAccept = async (parentId: string, userName) => {
 
       return sendPushNotificationsToUser(
         parent.uid,
-        `${userName} accepted care family invitation. Please complete setup in app.`
+        `${userName} has accepted your invitation, and joined the care family. You can now complete the setup in the Care Family tab.`,
+        { screen: "Caregivers" }
       )
         .then(() => {})
         .catch((error) => {
