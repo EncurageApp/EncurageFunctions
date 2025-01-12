@@ -724,9 +724,11 @@ function sendPushNotificationsToUser(
       }
 
       const recipientPushToken = snapshot.val();
+      const threadId = `${data?.eventId}-${Date.now()}`;
 
       const androidConfig: admin.messaging.AndroidConfig = {
         priority: "high",
+        collapseKey: threadId || "default", // Use a unique key for Android notifications
       };
 
       const iosConfig: admin.messaging.ApnsConfig = {
@@ -736,7 +738,9 @@ function sendPushNotificationsToUser(
         payload: {
           aps: {
             sound: "default",
-            badge: 0,
+            // badge: 0,
+            "content-available": 1,
+            "thread-id": threadId || "default", // Unique thread ID for grouping
           },
         },
       };
@@ -747,7 +751,9 @@ function sendPushNotificationsToUser(
           title: "Encurage",
           body: payload,
         },
-        data: data,
+        data: {
+          ...data,
+        },
         android: androidConfig,
         apns: iosConfig,
       };
