@@ -1,18 +1,13 @@
 /**
- * Import function triggers from their respective submodules:
- *
- * import {onCall} from 'firebase-functions/v2/https';
- * import {onDocumentWritten} from 'firebase-functions/v2/firestore';
- *
  * See a full list of supported triggers at https://firebase.google.com/docs/functions
  */
 
-// import { onRequest } from 'firebase-functions/v2/https';
 import * as v1 from "firebase-functions/v1";
 // import * as v2 from "firebase-functions/v2";
 import * as logger from "firebase-functions/logger";
 import * as admin from "firebase-admin";
 import moment from "moment-timezone";
+import axios from "axios";
 
 admin.initializeApp();
 const db = admin.database();
@@ -52,7 +47,7 @@ const addFolderToChild = async (childId, folderName) => {
 export const deleteExpiredCodesCron = v1.pubsub
   .schedule("0 0 * * *")
   .onRun(async (context) => {
-    console.log("daily_job ran");
+    logger.log("daily_job ran");
 
     const caregiverInviteRef = db.ref("caregiver_invite");
     const currentTime = Date.now();
@@ -62,7 +57,7 @@ export const deleteExpiredCodesCron = v1.pubsub
       const snapshot = await caregiverInviteRef.once("value");
 
       if (!snapshot.exists()) {
-        console.log("No caregiver invites found.");
+        logger.log("No caregiver invites found.");
         return null;
       }
 
@@ -78,10 +73,10 @@ export const deleteExpiredCodesCron = v1.pubsub
       // Execute all delete promises
       await Promise.all(expiredDeletes);
 
-      console.log("Expired codes deleted successfully.");
+      logger.log("Expired codes deleted successfully.");
       return { message: "Expired codes cleanup completed" };
     } catch (error) {
-      console.error("Error deleting expired codes:", error);
+      logger.error("Error deleting expired codes:", error);
       throw new v1.https.HttpsError(
         "internal",
         "An error occurred during expired code cleanup."
@@ -90,7 +85,7 @@ export const deleteExpiredCodesCron = v1.pubsub
   });
 //
 export const pushCron = v1.pubsub.schedule("*/1 * * * *").onRun((context) => {
-  console.log("minute_job ran");
+  logger.log("minute_job ran");
   return checkForOutStandingNotifications()
     .then((result) => {
       logger.log("minute_job finished", { result });
@@ -204,7 +199,7 @@ const checkEventDoses = async () => {
           });
         })
         .catch((error) => {
-          console.error(
+          logger.error(
             `checkEventDoses Error for childId: ${event.childId}`,
             error
           );
@@ -289,7 +284,7 @@ const checkNextNotificationTime = async () => {
           });
         })
         .catch((error) => {
-          console.error(
+          logger.error(
             `checkNextNotificationTime Error for childId: ${event.childId}`,
             error
           );
@@ -378,7 +373,7 @@ const processPrescriptionEvents = async () => {
           });
         })
         .catch((error) => {
-          console.error(
+          logger.error(
             `Error processing prescription dose for child: ${event.childId}`,
             error
           );
@@ -472,7 +467,7 @@ const processPrescriptionNextNotificationTime = async () => {
           });
         })
         .catch((error) => {
-          console.error(
+          logger.error(
             `Error processing dose for childId: ${event.childId}`,
             error
           );
@@ -625,7 +620,7 @@ function updatePrescriptionEventNotificationCount(
     newDoseRef.set(dose);
     // Update the event with a new nextScheduledDose time
     const timeStamp = calculateNextDose(prescription, timeZone);
-    console.log("timeStamp", timeStamp);
+    logger.log("timeStamp", timeStamp);
     updates.nextScheduledDose = timeStamp;
   }
 
@@ -666,7 +661,7 @@ const fetchCareFamilyMembers = async (parentId: string, childID: string) => {
 
     return validCaregivers; // Return caregivers with allowsPushNotifications === true
   } catch (error) {
-    console.error("Error fetching care family members:", error);
+    logger.error("Error fetching care family members:", error);
     return [];
   }
 };
@@ -717,14 +712,14 @@ function sendPushNotificationsToUser(
     .once("value")
     .then((snapshot): any => {
       if (!snapshot.exists()) {
-        console.log(
+        logger.log(
           `No push token found for user ${userId}. Cannot send notification.`
         );
         return { successCount: 0, failureCount: 0, results: [] };
       }
 
       const recipientPushToken = snapshot.val();
-      const threadId = `${data?.eventId}-${Date.now()}`;
+      const threadId = data?.eventId;
 
       const androidConfig: admin.messaging.AndroidConfig = {
         priority: "high",
@@ -760,11 +755,11 @@ function sendPushNotificationsToUser(
       return admin.messaging().send(message);
     })
     .then((response: any) => {
-      console.log(`Successfully sent message:`, response);
+      logger.log(`Successfully sent message:`, response);
       return Promise.resolve(response);
     })
     .catch((error) => {
-      console.error("sendPushNotificationsToUser error", error);
+      logger.error("sendPushNotificationsToUser error", error);
     });
 }
 
@@ -779,7 +774,7 @@ const getPrescription = async (prescriptionId: string) => {
     }
     return prescription;
   } catch (error) {
-    console.error(
+    logger.error(
       `Error fetching prescription for ID ${prescriptionId}:`,
       error
     );
@@ -818,7 +813,7 @@ const getCareFamilyName = async (parentId: string): Promise<string> => {
     }
     return "Our Care Family"; // Default name if no familyName exists
   } catch (error) {
-    console.error("getCareFamilyName Error", error);
+    logger.error("getCareFamilyName Error", error);
     throw new v1.https.HttpsError(
       "internal",
       "Unable to retrieve family name."
@@ -1093,7 +1088,7 @@ export const moveOrDeleteFolder = v1.https.onCall(async (data, context) => {
 
     // If no entries are found, initialize entries as an empty object
     if (!entries) {
-      console.log(`No entries found in folder ${folderID}`);
+      logger.log(`No entries found in folder ${folderID}`);
     }
 
     if (moveTracks) {
@@ -1137,7 +1132,7 @@ export const moveOrDeleteFolder = v1.https.onCall(async (data, context) => {
       code: "SUCCESS",
     };
   } catch (error) {
-    console.error("Error moving or deleting folder entries or folder:", error);
+    logger.error("Error moving or deleting folder entries or folder:", error);
     logger.log("error", error);
     throw new v1.https.HttpsError("internal", error.message);
   }
@@ -1167,7 +1162,7 @@ export const deleteEntries = v1.https.onCall(async (data, context) => {
       code: "SUCCESS",
     };
   } catch (error) {
-    console.error("Error moving or deleting folder entry or folder:", error);
+    logger.error("Error moving or deleting folder entry or folder:", error);
     throw new v1.https.HttpsError("internal", error.message);
   }
 });
@@ -1218,7 +1213,7 @@ export const generateCaregiverInviteCode = v1.https.onCall(
         .push(inviteData);
       return { success: true, inviteId: inviteRef.key, code };
     } catch (error) {
-      console.error("Error creating caregiver invite:", error);
+      logger.error("Error creating caregiver invite:", error);
       throw new v1.https.HttpsError(
         "internal",
         "Failed to create caregiver invite."
@@ -1306,7 +1301,7 @@ export const verifyAndAddCaregiver = v1.https.onCall(async (data, context) => {
       caregiverId: caregiverRef.key,
     };
   } catch (error) {
-    console.error("Error verifying and adding caregiver:", error);
+    logger.error("Error verifying and adding caregiver:", error);
     throw new v1.https.HttpsError(
       "internal",
       "An error occurred while processing the request."
@@ -1332,14 +1327,14 @@ const sendPushAfterInviteAccept = async (parentId: string, userName) => {
       )
         .then(() => {})
         .catch((error) => {
-          console.error(
+          logger.error(
             "Error sending care family invitation Push Notification",
             error
           );
         });
     });
   } catch (error) {
-    console.error(
+    logger.error(
       "Error sending care family invitation Push Notification",
       error
     );
@@ -1385,7 +1380,7 @@ export const updateCareFamilyName = v1.https.onCall(async (data, context) => {
       code: "SUCCESS",
     };
   } catch (error) {
-    console.error("Error updating care family name:", error);
+    logger.error("Error updating care family name:", error);
     throw new v1.https.HttpsError(
       "internal",
       "An error occurred while updating the care family name."
@@ -1483,7 +1478,7 @@ export const addPrescriptionAndEvent = v1.https.onCall(
         status: "OK",
       };
     } catch (error) {
-      console.error("Error adding prescription and events:", error);
+      logger.error("Error adding prescription and events:", error);
       throw new v1.https.HttpsError(
         "internal",
         "An error occurred while processing the request."
@@ -1491,6 +1486,346 @@ export const addPrescriptionAndEvent = v1.https.onCall(
     }
   }
 );
+
+// Define endpoints for receipt validation
+const APPLE_RECEIPT_VALIDATION_URL =
+  "https://buy.itunes.apple.com/verifyReceipt";
+const APPLE_SANDBOX_URL = "https://sandbox.itunes.apple.com/verifyReceipt";
+const GOOGLE_PLAY_VALIDATION_URL =
+  "https://androidpublisher.googleapis.com/androidpublisher/v3/applications";
+
+/**
+ * Validates in-app purchase receipts for Apple and Google Play.
+ * @param {Object} data - Request data from the client.
+ * @returns {Promise<Object>} Validation result.
+ */
+exports.validatePurchase = v1.https.onCall(async (data, context) => {
+  const { platform, receipt, packageName, productId } = data;
+
+  // Ensure the user is authenticated
+  if (!context.auth) {
+    throw new v1.https.HttpsError(
+      "unauthenticated",
+      "The function must be called while authenticated."
+    );
+  }
+
+  const userId = context.auth.uid; // Extract the authenticated user's UID
+
+  if (!platform || !receipt) {
+    throw new v1.https.HttpsError(
+      "invalid-argument",
+      "The function must be called with a platform and receipt."
+    );
+  }
+
+  try {
+    let validationResponse;
+    const now = Date.now();
+
+    if (platform === "ios") {
+      // Apple Receipt Validation
+      validationResponse = await validateAppleReceipt(receipt);
+      if (validationResponse.status !== 0) {
+        throw new Error("Invalid Apple receipt.");
+      }
+
+      // Parse the `latest_receipt_info`
+      const latestReceiptInfo = validationResponse.latest_receipt_info || [];
+
+      // Find the most recent valid subscription
+      const activeSubscription = latestReceiptInfo.find((info) => {
+        return parseInt(info.expires_date_ms, 10) > now;
+      });
+
+      const subscriptionExpiry = activeSubscription
+        ? new Date(parseInt(activeSubscription.expires_date_ms, 10))
+        : null;
+
+      // Update subscription status in the database
+      await admin
+        .database()
+        .ref(`/users/${userId}`)
+        .update({
+          purchaseInfo: {
+            subscriptionExpiry: subscriptionExpiry?.toISOString() || null,
+            productId,
+            transactionReceipt: receipt, // For Apple
+          },
+          subscribed: !!activeSubscription, // true if an active subscription exists
+        });
+
+      logger.log("validationResponse", validationResponse);
+      logger.log("validationResponse.status", validationResponse.status);
+
+      return {
+        status: validationResponse.status, // Apple status
+        latestReceiptInfo: validationResponse.latest_receipt_info[0], // Pass other info if needed
+        subscriptionStatus: !!activeSubscription,
+      };
+    } else if (platform === "android") {
+      // Google Play Receipt Validation
+      validationResponse = await validateGoogleReceipt(
+        receipt.purchaseToken,
+        packageName,
+        productId
+      );
+
+      if (!validationResponse || validationResponse.purchaseState !== 0) {
+        throw new Error("Invalid Google Play receipt.");
+      }
+
+      const subscriptionExpiry = new Date(
+        parseInt(validationResponse.expiryTimeMillis, 10)
+      );
+
+      await admin
+        .database()
+        .ref(`/users/${userId}`)
+        .update({
+          purchaseInfo: {
+            subscriptionExpiry: subscriptionExpiry.toISOString(),
+            productId,
+            purchaseToken: receipt.purchaseToken, // For Google
+          },
+          subscribed: subscriptionExpiry.getTime() > now,
+        });
+
+      logger.log("validationResponse", validationResponse);
+      logger.log("validationResponse.status", validationResponse.status);
+
+      return {
+        purchaseState: validationResponse.purchaseState, // Google purchase state
+        orderId: validationResponse.orderId, // Additional info if needed
+        subscriptionStatus: subscriptionExpiry.getTime() > now,
+      };
+    } else {
+      throw new v1.https.HttpsError(
+        "invalid-argument",
+        "Invalid platform specified."
+      );
+      return {
+        success: false,
+      };
+    }
+  } catch (error) {
+    logger.error("Error validating purchase:", error);
+    throw new v1.https.HttpsError("internal", "Purchase validation failed.");
+  }
+});
+
+exports.checkSubscription = v1.https.onCall(async (data, context) => {
+  logger.log("data", data);
+  // Ensure the user is authenticated
+  if (!context.auth) {
+    logger.error("Unauthenticated request.");
+    throw new v1.https.HttpsError(
+      "unauthenticated",
+      "The function must be called while authenticated."
+    );
+  }
+
+  const userId = context.auth.uid; // Extract the authenticated user's UID
+  logger.log(`Checking subscription for user: ${userId}`);
+
+  try {
+    const userRef = admin.database().ref(`/users/${userId}`);
+    const userSnapshot = await userRef.once("value");
+    const userData = userSnapshot.val();
+
+    if (
+      !userData ||
+      (!userData.purchaseInfo?.transactionReceipt &&
+        !userData.purchaseInfo?.purchaseToken)
+    ) {
+      logger.warn(
+        `No subscription data found for user: ${userId}. Data: ${JSON.stringify(
+          userData
+        )}`
+      );
+      throw new v1.https.HttpsError(
+        "not-found",
+        "No subscription data found for this user."
+      );
+    }
+
+    logger.log(
+      `User subscription data retrieved: ${JSON.stringify(
+        userData.purchaseInfo
+      )}`
+    );
+
+    let validationResponse;
+    const now = Date.now();
+    let isSubscribed = false;
+    let subscriptionExpiry = null;
+
+    if (userData.purchaseInfo?.transactionReceipt) {
+      logger.log("Validating with Apple...");
+      validationResponse = await validateAppleReceipt(
+        userData.purchaseInfo.transactionReceipt
+      );
+
+      logger.log("Apple validation response:", validationResponse);
+
+      if (
+        validationResponse.status === 0 ||
+        validationResponse.status === 21006
+      ) {
+        const latestReceiptInfo = validationResponse.latest_receipt_info || [];
+        logger.log("Latest receipt info:", latestReceiptInfo);
+
+        const activeSubscription = latestReceiptInfo.find(
+          (info) => parseInt(info.expires_date_ms, 10) > now
+        );
+
+        isSubscribed = !!activeSubscription;
+        subscriptionExpiry = activeSubscription
+          ? new Date(
+              parseInt(activeSubscription.expires_date_ms, 10)
+            ).toISOString()
+          : null;
+      } else {
+        logger.warn(
+          `Apple receipt validation failed with status: ${validationResponse.status}`
+        );
+      }
+    } else if (userData.purchaseInfo?.purchaseToken) {
+      logger.log("Validating with Google...");
+      validationResponse = await validateGoogleReceipt(
+        userData.purchaseInfo.purchaseToken,
+        "com.encurage", // Replace with your package name
+        userData.purchaseInfo.productID // Product ID stored during purchase
+      );
+
+      logger.log("Google validation response:", validationResponse);
+
+      if (validationResponse && validationResponse.purchaseState === 0) {
+        const expiryDate = new Date(
+          parseInt(validationResponse.expiryTimeMillis, 10)
+        );
+
+        isSubscribed = expiryDate.getTime() > now;
+        subscriptionExpiry = isSubscribed ? expiryDate.toISOString() : null;
+      } else {
+        logger.warn(
+          `Google receipt validation failed with purchaseState: ${validationResponse?.purchaseState}`
+        );
+      }
+    } else {
+      logger.error("No valid receipt data found for validation.");
+    }
+
+    logger.log(
+      `Subscription status for user ${userId}: isSubscribed=${isSubscribed}, subscriptionExpiry=${subscriptionExpiry}`
+    );
+
+    let purchaseInfo = null;
+
+    if (isSubscribed === true) {
+      purchaseInfo = {
+        ...userData.purchaseInfo,
+        subscriptionExpiry, // Update the expiry if subscribed
+      };
+    }
+
+    // Update the subscription status and purchaseInfo
+    await userRef.update({
+      subscribed: isSubscribed,
+      purchaseInfo, // This will be null if not subscribed
+    });
+
+    logger.log(
+      `Subscription data updated for user ${userId}. Subscribed: ${isSubscribed}, Expiry: ${subscriptionExpiry}`
+    );
+
+    return {
+      subscribed: isSubscribed,
+      subscriptionExpiry,
+    };
+  } catch (error) {
+    logger.error(`Error checking subscription for user ${userId}:`, error);
+    throw new v1.https.HttpsError(
+      "internal",
+      "Failed to check subscription status."
+    );
+  }
+});
+
+/**
+ * Validates an Apple receipt.
+ * @param {string} receipt - Base64-encoded receipt.
+ * @returns {Promise<Object>} Validation result.
+ */
+async function validateAppleReceipt(receipt) {
+  const sharedSecret = v1.config().appstore.shared_secret;
+
+  const body = {
+    "receipt-data": receipt,
+    password: sharedSecret, // Replace with your App Store shared secret
+  };
+
+  try {
+    let response = await axios.post(APPLE_RECEIPT_VALIDATION_URL, body);
+    // If the environment is sandbox, retry with the sandbox URL
+    if (response.data.status === 21007) {
+      response = await axios.post(APPLE_SANDBOX_URL, body);
+    }
+    return response.data;
+  } catch (error) {
+    logger.error("Apple receipt validation failed:", error);
+    throw error;
+  }
+}
+
+/**
+ * Validates a Google Play receipt.
+ * @param {string} purchaseToken - The purchase token from the client.
+ * @param {string} packageName - The app package name.
+ * @param {string} productId - The product ID of the subscription or in-app item.
+ * @returns {Promise<Object>} Validation result.
+ */
+async function validateGoogleReceipt(purchaseToken, packageName, productId) {
+  const credentials = await admin.credential.applicationDefault();
+  const authToken = await credentials.getAccessToken();
+  logger.log("authToken", authToken);
+
+  const url = `${GOOGLE_PLAY_VALIDATION_URL}/${packageName}/purchases/products/${productId}/tokens/${purchaseToken}`;
+  try {
+    const response = await axios.get(url, {
+      headers: {
+        Authorization: `Bearer ${authToken.access_token}`,
+      },
+    });
+
+    // Step 2: Check acknowledgment status
+    if (response.data?.acknowledgementState === 0) {
+      // Acknowledge the purchase if not already acknowledged
+      const acknowledge = await axios.post(
+        `${GOOGLE_PLAY_VALIDATION_URL}/${packageName}/purchases/subscriptions/${productId}/tokens/${purchaseToken}:acknowledge`,
+        {},
+        {
+          headers: {
+            Authorization: `Bearer ${authToken.access_token}`,
+          },
+        }
+      );
+      logger.log("acknowledge", acknowledge);
+      logger.log(
+        "Purchase acknowledged successfully for token:",
+        purchaseToken
+      );
+    }
+
+    return response.data;
+  } catch (error) {
+    logger.error(
+      "Google receipt validation failed:",
+      error.response?.data || error
+    );
+    throw error;
+  }
+}
 
 export type Doses = {
   id: string;
