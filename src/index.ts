@@ -8,6 +8,7 @@ import * as logger from "firebase-functions/logger";
 import * as admin from "firebase-admin";
 import moment from "moment-timezone";
 import axios from "axios";
+import { google } from "googleapis";
 
 admin.initializeApp();
 const db = admin.database();
@@ -1464,11 +1465,21 @@ export const addPrescriptionAndEvent = v1.https.onCall(
         }
       );
 
-      // Step 4: Wait for all writes to complete
+      // Step 4: Increment eoasCount for the user
+      const userRef = db.ref(`/users/${prescription.parentId}`);
+      const incrementEoasCount = userRef.transaction((user) => {
+        if (user) {
+          user.eoasCount = (user.eoasCount || 0) + 1;
+        }
+        return user;
+      });
+
+      // Step 5: Wait for all writes to complete
       await Promise.all([
         savePrescription,
         savePrescriptionEvent,
         ...doseWrites,
+        incrementEoasCount,
       ]);
 
       return {
@@ -1491,8 +1502,6 @@ export const addPrescriptionAndEvent = v1.https.onCall(
 const APPLE_RECEIPT_VALIDATION_URL =
   "https://buy.itunes.apple.com/verifyReceipt";
 const APPLE_SANDBOX_URL = "https://sandbox.itunes.apple.com/verifyReceipt";
-const GOOGLE_PLAY_VALIDATION_URL =
-  "https://androidpublisher.googleapis.com/androidpublisher/v3/applications";
 
 /**
  * Validates in-app purchase receipts for Apple and Google Play.
@@ -1522,6 +1531,13 @@ exports.validatePurchase = v1.https.onCall(async (data, context) => {
   try {
     let validationResponse;
     const now = Date.now();
+
+    logger.log("Validating purchase:", {
+      platform,
+      receipt,
+      packageName,
+      productId,
+    });
 
     if (platform === "ios") {
       // Apple Receipt Validation
@@ -1565,15 +1581,21 @@ exports.validatePurchase = v1.https.onCall(async (data, context) => {
       };
     } else if (platform === "android") {
       // Google Play Receipt Validation
+      const parsedReceipt =
+        typeof receipt === "string" ? JSON.parse(receipt) : receipt;
+      const purchaseToken = parsedReceipt.purchaseToken;
+
       validationResponse = await validateGoogleReceipt(
-        receipt.purchaseToken,
+        purchaseToken,
         packageName,
         productId
       );
 
-      if (!validationResponse || validationResponse.purchaseState !== 0) {
-        throw new Error("Invalid Google Play receipt.");
-      }
+      logger.log("Google Validation Response:", validationResponse);
+
+      // if (!validationResponse || validationResponse.purchaseState !== 0) {
+      //   throw new Error("Invalid Google Play receipt.");
+      // }
 
       const subscriptionExpiry = new Date(
         parseInt(validationResponse.expiryTimeMillis, 10)
@@ -1586,7 +1608,7 @@ exports.validatePurchase = v1.https.onCall(async (data, context) => {
           purchaseInfo: {
             subscriptionExpiry: subscriptionExpiry.toISOString(),
             productId,
-            purchaseToken: receipt.purchaseToken, // For Google
+            purchaseToken: purchaseToken, // For Google
           },
           subscribed: subscriptionExpiry.getTime() > now,
         });
@@ -1595,7 +1617,7 @@ exports.validatePurchase = v1.https.onCall(async (data, context) => {
       logger.log("validationResponse.status", validationResponse.status);
 
       return {
-        purchaseState: validationResponse.purchaseState, // Google purchase state
+        purchaseState: validationResponse.paymentState, // Google purchase state
         orderId: validationResponse.orderId, // Additional info if needed
         subscriptionStatus: subscriptionExpiry.getTime() > now,
       };
@@ -1614,8 +1636,9 @@ exports.validatePurchase = v1.https.onCall(async (data, context) => {
   }
 });
 
-exports.checkSubscription = v1.https.onCall(async (data, context) => {
-  logger.log("data", data);
+exports.checkSubscription = v1.https.onCall(async (_, context) => {
+  logger.log("data", _);
+
   // Ensure the user is authenticated
   if (!context.auth) {
     logger.error("Unauthenticated request.");
@@ -1643,10 +1666,6 @@ exports.checkSubscription = v1.https.onCall(async (data, context) => {
           userData
         )}`
       );
-      throw new v1.https.HttpsError(
-        "not-found",
-        "No subscription data found for this user."
-      );
     }
 
     logger.log(
@@ -1662,6 +1681,7 @@ exports.checkSubscription = v1.https.onCall(async (data, context) => {
 
     if (userData.purchaseInfo?.transactionReceipt) {
       logger.log("Validating with Apple...");
+
       validationResponse = await validateAppleReceipt(
         userData.purchaseInfo.transactionReceipt
       );
@@ -1692,15 +1712,16 @@ exports.checkSubscription = v1.https.onCall(async (data, context) => {
       }
     } else if (userData.purchaseInfo?.purchaseToken) {
       logger.log("Validating with Google...");
+
       validationResponse = await validateGoogleReceipt(
         userData.purchaseInfo.purchaseToken,
-        "com.encurage", // Replace with your package name
-        userData.purchaseInfo.productID // Product ID stored during purchase
+        "com.encurage",
+        userData.purchaseInfo.productId // Product ID stored during purchase
       );
 
       logger.log("Google validation response:", validationResponse);
 
-      if (validationResponse && validationResponse.purchaseState === 0) {
+      if (validationResponse && validationResponse.paymentState === 1) {
         const expiryDate = new Date(
           parseInt(validationResponse.expiryTimeMillis, 10)
         );
@@ -1716,24 +1737,14 @@ exports.checkSubscription = v1.https.onCall(async (data, context) => {
       logger.error("No valid receipt data found for validation.");
     }
 
-    logger.log(
-      `Subscription status for user ${userId}: isSubscribed=${isSubscribed}, subscriptionExpiry=${subscriptionExpiry}`
-    );
-
-    let purchaseInfo = null;
-
-    if (isSubscribed === true) {
-      purchaseInfo = {
-        ...userData.purchaseInfo,
-        subscriptionExpiry, // Update the expiry if subscribed
-      };
-    }
-
     // Update the subscription status and purchaseInfo
     await userRef.update({
       subscribed: isSubscribed,
-      purchaseInfo, // This will be null if not subscribed
     });
+
+    if (isSubscribed === false) {
+      // remove care fam stuff userId: userId
+    }
 
     logger.log(
       `Subscription data updated for user ${userId}. Subscribed: ${isSubscribed}, Expiry: ${subscriptionExpiry}`
@@ -1786,30 +1797,33 @@ async function validateAppleReceipt(receipt) {
  * @returns {Promise<Object>} Validation result.
  */
 async function validateGoogleReceipt(purchaseToken, packageName, productId) {
-  const credentials = await admin.credential.applicationDefault();
-  const authToken = await credentials.getAccessToken();
-  logger.log("authToken", authToken);
+  const auth = new google.auth.GoogleAuth({
+    keyFile: "encurage-new-18b38f50569d.json",
+    scopes: ["https://www.googleapis.com/auth/androidpublisher"],
+  });
 
-  const url = `${GOOGLE_PLAY_VALIDATION_URL}/${packageName}/purchases/products/${productId}/tokens/${purchaseToken}`;
   try {
-    const response = await axios.get(url, {
-      headers: {
-        Authorization: `Bearer ${authToken.access_token}`,
-      },
-    });
+    const response = await google
+      .androidpublisher("v3")
+      .purchases.subscriptions.get({
+        packageName: packageName,
+        subscriptionId: productId,
+        token: purchaseToken,
+        auth: auth,
+      });
 
     // Step 2: Check acknowledgment status
     if (response.data?.acknowledgementState === 0) {
       // Acknowledge the purchase if not already acknowledged
-      const acknowledge = await axios.post(
-        `${GOOGLE_PLAY_VALIDATION_URL}/${packageName}/purchases/subscriptions/${productId}/tokens/${purchaseToken}:acknowledge`,
-        {},
-        {
-          headers: {
-            Authorization: `Bearer ${authToken.access_token}`,
-          },
-        }
-      );
+      const acknowledge = await google
+        .androidpublisher("v3")
+        .purchases.subscriptions.acknowledge({
+          packageName: packageName,
+          subscriptionId: productId,
+          token: purchaseToken,
+          auth: auth,
+        });
+
       logger.log("acknowledge", acknowledge);
       logger.log(
         "Purchase acknowledged successfully for token:",
@@ -1819,10 +1833,7 @@ async function validateGoogleReceipt(purchaseToken, packageName, productId) {
 
     return response.data;
   } catch (error) {
-    logger.error(
-      "Google receipt validation failed:",
-      error.response?.data || error
-    );
+    logger.error("Google receipt validation failed:", error);
     throw error;
   }
 }
