@@ -1700,6 +1700,9 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
         );
 
         isSubscribed = !!activeSubscription;
+
+        // TODO: account for grace period, 7 month, 14 year
+
         subscriptionExpiry = activeSubscription
           ? new Date(
               parseInt(activeSubscription.expires_date_ms, 10)
@@ -1725,6 +1728,8 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
         const expiryDate = new Date(
           parseInt(validationResponse.expiryTimeMillis, 10)
         );
+
+        // TODO: account for grace period, 7 month, 14 year
 
         isSubscribed = expiryDate.getTime() > now;
         subscriptionExpiry = isSubscribed ? expiryDate.toISOString() : null;
