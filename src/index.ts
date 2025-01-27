@@ -822,6 +822,40 @@ const getCareFamilyName = async (parentId: string): Promise<string> => {
   }
 };
 
+const removeAllCaregiversForUser = async (userId) => {
+  try {
+    const caregiverRef = db.ref("caregiver");
+
+    // Query caregivers associated with the user ID (parent ID)
+    const caregiverSnapshot = await caregiverRef
+      .orderByChild("parent_id")
+      .equalTo(userId)
+      .once("value");
+
+    if (!caregiverSnapshot.exists()) {
+      logger.log(`No caregivers found for user: ${userId}`);
+      return { message: "No caregivers to remove" };
+    }
+
+    const caregiverIds = Object.keys(caregiverSnapshot.val());
+
+    // Remove all caregivers in parallel
+    const removalPromises = caregiverIds.map((key) =>
+      caregiverRef.child(key).remove()
+    );
+
+    await Promise.all(removalPromises);
+    logger.log(`All caregivers removed for user: ${userId}`);
+    return { message: "All caregivers removed successfully" };
+  } catch (error) {
+    logger.error(`Error removing caregivers for user ${userId}:`, error);
+    throw new v1.https.HttpsError(
+      "internal",
+      "Failed to remove caregivers for the user."
+    );
+  }
+};
+
 enum FrequencyInterval {
   HOURLY = "hourly", // ok
   DAILY = "daily", // ok
@@ -1748,7 +1782,8 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
     });
 
     if (isSubscribed === false) {
-      // remove care fam stuff userId: userId
+      //  Remove all caregivers associated with the user
+      await removeAllCaregiversForUser(userId);
     }
 
     logger.log(
