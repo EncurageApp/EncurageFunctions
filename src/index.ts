@@ -1647,9 +1647,6 @@ exports.validatePurchase = v1.https.onCall(async (data, context) => {
           subscribed: subscriptionExpiry.getTime() > now,
         });
 
-      logger.log("validationResponse", validationResponse);
-      logger.log("validationResponse.status", validationResponse.status);
-
       return {
         purchaseState: validationResponse.paymentState, // Google purchase state
         orderId: validationResponse.orderId, // Additional info if needed
@@ -1712,6 +1709,14 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
     const now = Date.now();
     let isSubscribed = false;
     let subscriptionExpiry = null;
+    let updatedPurchaseInfo = { ...userData.purchaseInfo };
+
+    const applyGracePeriod = (expiryMillis, isAnnual) => {
+      const gracePeriod = isAnnual
+        ? 14 * 24 * 60 * 60 * 1000
+        : 7 * 24 * 60 * 60 * 1000;
+      return expiryMillis + gracePeriod > now;
+    };
 
     if (userData.purchaseInfo?.transactionReceipt) {
       logger.log("Validating with Apple...");
@@ -1732,16 +1737,27 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
         const activeSubscription = latestReceiptInfo.find(
           (info) => parseInt(info.expires_date_ms, 10) > now
         );
+        logger.log("activeSubscription: ", activeSubscription);
 
         isSubscribed = !!activeSubscription;
 
-        // TODO: account for grace period, 7 month, 14 year
+        if (activeSubscription) {
+          const expiryMillis = parseInt(activeSubscription.expires_date_ms, 10);
+          const isAnnual = activeSubscription.product_id.includes("year");
 
-        subscriptionExpiry = activeSubscription
-          ? new Date(
-              parseInt(activeSubscription.expires_date_ms, 10)
-            ).toISOString()
-          : null;
+          const isBillingIssue = activeSubscription.payment_state === 0;
+          if (
+            !isSubscribed &&
+            isBillingIssue &&
+            applyGracePeriod(expiryMillis, isAnnual)
+          ) {
+            isSubscribed = true;
+          }
+
+          subscriptionExpiry = new Date(expiryMillis).toISOString();
+          updatedPurchaseInfo.transactionReceipt =
+            validationResponse.latest_receipt;
+        }
       } else {
         logger.warn(
           `Apple receipt validation failed with status: ${validationResponse.status}`
@@ -1753,23 +1769,36 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
       validationResponse = await validateGoogleReceipt(
         userData.purchaseInfo.purchaseToken,
         "com.encurage",
-        userData.purchaseInfo.productId // Product ID stored during purchase
+        userData.purchaseInfo.productId
       );
 
       logger.log("Google validation response:", validationResponse);
 
-      if (validationResponse && validationResponse.paymentState === 1) {
-        const expiryDate = new Date(
-          parseInt(validationResponse.expiryTimeMillis, 10)
-        );
+      if (validationResponse) {
+        const expiryMillis = parseInt(validationResponse.expiryTimeMillis, 10);
+        const isAnnual = validationResponse.priceAmountMicros > 5000000; // Adjust based on your pricing
 
-        // TODO: account for grace period, 7 month, 14 year
+        if (validationResponse.paymentState === 0) {
+          // Billing issue: Apply grace period
+          if (applyGracePeriod(expiryMillis, isAnnual)) {
+            isSubscribed = true;
+          }
+        } else if (validationResponse.paymentState === 1) {
+          // Payment received
+          isSubscribed = expiryMillis > now;
+        }
 
-        isSubscribed = expiryDate.getTime() > now;
-        subscriptionExpiry = isSubscribed ? expiryDate.toISOString() : null;
+        subscriptionExpiry = isSubscribed
+          ? new Date(expiryMillis).toISOString()
+          : null;
+
+        // if (validationResponse.linkedPurchaseToken) {
+        //   updatedPurchaseInfo.purchaseToken =
+        //     validationResponse.linkedPurchaseToken;
+        // }
       } else {
         logger.warn(
-          `Google receipt validation failed with purchaseState: ${validationResponse?.purchaseState}`
+          `Google receipt validation failed with paymentState: ${validationResponse?.paymentState}`
         );
       }
     } else {
@@ -1779,10 +1808,11 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
     // Update the subscription status and purchaseInfo
     await userRef.update({
       subscribed: isSubscribed,
+      purchaseInfo: updatedPurchaseInfo,
     });
 
     if (isSubscribed === false) {
-      //  Remove all caregivers associated with the user
+      // Remove all caregivers associated with the user
       await removeAllCaregiversForUser(userId);
     }
 
@@ -1870,7 +1900,7 @@ async function validateGoogleReceipt(purchaseToken, packageName, productId) {
         purchaseToken
       );
     }
-
+    logger.log("validateGoogleReceipt response", response);
     return response.data;
   } catch (error) {
     logger.error("Google receipt validation failed:", error);
