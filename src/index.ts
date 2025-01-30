@@ -1352,7 +1352,7 @@ const sendPushAfterInviteAccept = async (parentId: string, userName) => {
       }
       const parentPushToken = parent?.pushToken;
       if (!parentPushToken) {
-        throw new Error(`No pushToken for parent with ID ${parent.uid}`);
+        logger.log(`No pushToken for parent with ID ${parent.uid}`);
       }
 
       return sendPushNotificationsToUser(
