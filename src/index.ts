@@ -10,8 +10,29 @@ import moment from "moment-timezone";
 import axios from "axios";
 import { google } from "googleapis";
 
-admin.initializeApp();
-const db = admin.database();
+// admin.initializeApp();
+// const db = admin.database();
+// 1) Default app
+admin.initializeApp(
+  {
+    databaseURL: "https://encurage-new-default-rtdb.firebaseio.com",
+    // plus any other config if necessary
+  },
+  "defaultApp"
+);
+
+// 2) Secondary app
+admin.initializeApp(
+  {
+    databaseURL: "https://oncure-data.firebaseio.com",
+    // same or similar credentials if in the same project
+  },
+  "onCureApp"
+);
+
+// Get the database reference for each
+const db = admin.app("defaultApp").database();
+const onCureDb = admin.app("onCureApp").database();
 
 // Start writing functions
 // https://firebase.google.com/docs/functions/typescript
@@ -1833,6 +1854,194 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
   }
 });
 
+exports.convertOnCureUser = v1.https.onCall(async (data, context) => {
+  console.log("data", data);
+  console.log("context.auth", context.auth);
+  if (!context.auth) {
+    throw new v1.https.HttpsError(
+      "unauthenticated",
+      "Function must be called while authenticated."
+    );
+  }
+
+  const userId = context.auth.uid;
+
+  try {
+    // 1) Fetch old user
+    const userSnap = await onCureDb.ref(`/users/${userId}`).once("value");
+    if (!userSnap.exists()) {
+      throw new v1.https.HttpsError("not-found", `User ${userId} not found`);
+    }
+    const oldUserData = userSnap.val();
+
+    // 2) Fetch children
+    const childrenSnap = await onCureDb
+      .ref("/children")
+      .orderByChild("parent_id")
+      .equalTo(userId)
+      .once("value");
+
+    const childrenData = (childrenSnap.val() || {}) as Record<
+      string,
+      ChildData
+    >;
+
+    // 3) Build array of child IDs
+    const childIds = Object.keys(childrenData);
+
+    // 4) Transform old user data -> new user
+    const email = context.auth.token.email;
+    const newUser = transformOnCureUser(oldUserData, userId, email, childIds);
+
+    // 5) Transform each child
+    const updates: Record<string, any> = {};
+    updates[`/users/${userId}`] = newUser;
+
+    for (const [childId, childObject] of Object.entries(childrenData)) {
+      const transformedChild = transformOnCureChild(childObject, childId);
+      updates[`/children/${childId}`] = transformedChild;
+    }
+
+    // 6) Write to DB
+    await db.ref().update(updates);
+
+    // Return result
+    return {
+      user: newUser,
+      children: Object.entries(childrenData).map(([childId, childVal]) => ({
+        ...transformOnCureChild(childVal, childId),
+        id: childId,
+      })),
+    };
+  } catch (error) {
+    console.error("Error in convertOnCureUser:", error);
+    throw new v1.https.HttpsError(
+      "internal",
+      (error as Error)?.message || "Unknown error."
+    );
+  }
+});
+
+/**
+ * Transform the old onCure user data into the new `User` shape.
+ * - Copies all old fields by default.
+ * - Renames specific keys as needed.
+ * - Converts `dob` to epoch time.
+ * - Adds `legacySubscription` if any legacy fields are present.
+ * - Pulls `email` from the auth token (if available).
+ */
+function transformOnCureUser(
+  oldData: any,
+  userId: string,
+  email: string | undefined,
+  childrenIds: string[]
+) {
+  // 1) Start by shallow-copying all fields from the old data
+  //    so we keep anything that doesn’t match the new model.
+  const newUser: any = { ...oldData };
+
+  // 2) Required fields in your new model
+  newUser.uid = userId; // Must match the Auth user ID
+  newUser.email = email ?? ""; // Might be empty if not found
+  newUser.children = childrenIds; // The array of child IDs
+  newUser.agreeToTerm = false; // Default false if not found
+  newUser.authType = "unknown"; // Example default; customize as needed
+
+  // 3) Handle renamed fields
+  if (typeof newUser.first_name === "string") {
+    newUser.firstName = newUser.first_name;
+    delete newUser.first_name;
+  }
+  if (typeof newUser.last_name === "string") {
+    newUser.lastName = newUser.last_name;
+    delete newUser.last_name;
+  }
+  if (typeof newUser.apiVersion === "string") {
+    newUser.appVersion = newUser.apiVersion;
+    delete newUser.apiVersion;
+  }
+
+  // 4) Convert `dob` to epoch time if it’s a string (e.g., '1975-05-20T05:00:00.000+0000')
+  if (typeof newUser.dob === "string") {
+    const dateObj = new Date(newUser.dob);
+    if (!isNaN(dateObj.valueOf())) {
+      newUser.dob = dateObj.getTime(); // milliseconds since epoch
+    } else {
+      // If parsing fails, you could default to 0 or remove the field:
+      newUser.dob = 0;
+    }
+  }
+
+  // 5) Check for any legacy flags
+  const legacyFlags = [
+    "onCure360Enabled",
+    "ongoingRxFreeTrialStartDate",
+    "proMembershipEnabled",
+    "symptomTrackerEnabled",
+    "unlimitedEpisodesEnabled",
+  ];
+  for (const flag of legacyFlags) {
+    if (newUser[flag]) {
+      // If any of these are truthy, set legacySubscription = true
+      newUser.legacySubscription = true;
+      break;
+    }
+  }
+
+  // 6) Return the final object. You could cast to `User` if you like,
+  //    but remember we are keeping extra old fields.
+  return newUser;
+}
+
+/**
+ * Transforms a single old child record into the new ChildDataType + preserves extra fields.
+ * @param oldChildData - The original child object from onCureDb
+ * @param childId - The key/ID in the old DB (must remain the same).
+ */
+function transformOnCureChild(oldChildData: any, childId: string): any {
+  // 1. Start with a shallow copy so we keep any fields not in the new model
+  const newChild: any = { ...oldChildData };
+
+  // 2. Rename `full_name` -> `childName`
+  if (typeof newChild.full_name === "string") {
+    newChild.childName = newChild.full_name;
+    delete newChild.full_name;
+  }
+
+  // 3. Rename `dob` -> `childBDay`, convert the string to epoch time
+  if (typeof newChild.dob === "string") {
+    const dateObj = new Date(newChild.dob);
+    if (!isNaN(dateObj.valueOf())) {
+      newChild.childBDay = dateObj.getTime(); // e.g., 1688079463000
+    } else {
+      // If parsing fails, you could default to 0 or remove the field
+      newChild.childBDay = 0;
+    }
+    delete newChild.dob;
+  }
+
+  // 4. If `parent_id` exists, rename -> `parentId`
+  if (typeof newChild.parent_id === "string") {
+    newChild.parentId = newChild.parent_id;
+    delete newChild.parent_id;
+  }
+
+  // 5. Map `weight` -> `weightUnitMajor`, round down
+  if (typeof newChild.weight === "number") {
+    newChild.weightUnitMajor = Math.floor(newChild.weight); // remove decimals
+    delete newChild.weight; // remove old field if you wish
+  }
+
+  // 6. Hardcode weightUnit to 'lbs'
+  newChild.weightUnit = "lbs";
+
+  // 7. Retain the child’s ID
+  newChild.childId = childId;
+
+  // Return the transformed object
+  return newChild;
+}
+
 /**
  * Validates an Apple receipt.
  * @param {string} receipt - Base64-encoded receipt.
@@ -1908,7 +2117,7 @@ async function validateGoogleReceipt(purchaseToken, packageName, productId) {
   }
 }
 
-export type Doses = {
+type Doses = {
   id: string;
   name: string;
   prescriptionEventId: string;
@@ -1931,4 +2140,22 @@ type GivenBy = {
 type Dose = {
   date: number;
   givenBy?: GivenBy;
+};
+
+type ChildData = {
+  childName: string;
+  childBDay?: Date;
+  childPhotoURL?: string;
+  weightUnitMajor?: string;
+  weightUnitMinor?: string;
+  weightUnit?: string;
+  parentId?: string;
+  childId?: string;
+  // healthCareProviders?: DoctorType[];
+  // conditions?: ConditionType[];
+  // medications?: MedicationType[];
+  // dosages?: DosageType; // Changed type to DosageType
+  eventIds?: string[];
+  careFamilyId?: string;
+  careFamily?: any;
 };
