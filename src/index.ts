@@ -37,34 +37,34 @@ const onCureDb = admin.app("onCureApp").database();
 // Start writing functions
 // https://firebase.google.com/docs/functions/typescript
 
-export const newChildAdded = v1.database
-  .ref("children/{childId}")
-  .onCreate(async (snapshot, context) => {
-    const childId = context.params.childId; // Get the childId from the context
-    // const child = snapshot.val();
+// export const newChildAdded = v1.database
+//   .ref("children/{childId}")
+//   .onCreate(async (snapshot, context) => {
+//     const childId = context.params.childId; // Get the childId from the context
+//     // const child = snapshot.val();
 
-    // Call the function to create a folder with the same childId
-    await addFolderToChild(childId, "general");
+//     // Call the function to create a folder with the same childId
+//     await addFolderToChild(childId, "general");
 
-    return null; // Indicate completion
-  });
+//     return null; // Indicate completion
+//   });
 
 // Function to add a folder with a random ID to the child's folder array
-const addFolderToChild = async (childId, folderName) => {
-  // Reference to the child's folders array
-  const folderRef = db.ref(`/folders/${childId}`);
+// const addFolderToChild = async (childId, folderName) => {
+//   // Reference to the child's folders array
+//   const folderRef = db.ref(`/folders/${childId}`);
 
-  // Push a new folder with a random ID
-  const newFolderRef = folderRef.push(); // This generates a unique ID for the folder
+//   // Push a new folder with a random ID
+//   const newFolderRef = folderRef.push(); // This generates a unique ID for the folder
 
-  await newFolderRef.set({
-    id: newFolderRef.key, // Use the generated key as the folder ID
-    name: folderName,
-    createdAt: admin.database.ServerValue.TIMESTAMP,
-  });
+//   await newFolderRef.set({
+//     id: newFolderRef.key, // Use the generated key as the folder ID
+//     name: folderName,
+//     createdAt: admin.database.ServerValue.TIMESTAMP,
+//   });
 
-  return newFolderRef.key; // Return the unique key of the new folder
-};
+//   return newFolderRef.key; // Return the unique key of the new folder
+// };
 
 export const deleteExpiredCodesCron = v1.pubsub
   .schedule("0 0 * * *")
@@ -1552,7 +1552,7 @@ export const addPrescriptionAndEvent = v1.https.onCall(
     }
   }
 );
-
+// ***************************************************** Start Subscription ********************************
 // Define endpoints for receipt validation
 const APPLE_RECEIPT_VALIDATION_URL =
   "https://buy.itunes.apple.com/verifyReceipt";
@@ -1854,10 +1854,87 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
   }
 });
 
+/**
+ * Validates an Apple receipt.
+ * @param {string} receipt - Base64-encoded receipt.
+ * @returns {Promise<Object>} Validation result.
+ */
+async function validateAppleReceipt(receipt) {
+  const sharedSecret = v1.config().appstore.shared_secret;
+
+  const body = {
+    "receipt-data": receipt,
+    password: sharedSecret, // Replace with your App Store shared secret
+  };
+
+  try {
+    let response = await axios.post(APPLE_RECEIPT_VALIDATION_URL, body);
+    // If the environment is sandbox, retry with the sandbox URL
+    if (response.data.status === 21007) {
+      response = await axios.post(APPLE_SANDBOX_URL, body);
+    }
+    return response.data;
+  } catch (error) {
+    logger.error("Apple receipt validation failed:", error);
+    throw error;
+  }
+}
+
+/**
+ * Validates a Google Play receipt.
+ * @param {string} purchaseToken - The purchase token from the client.
+ * @param {string} packageName - The app package name.
+ * @param {string} productId - The product ID of the subscription or in-app item.
+ * @returns {Promise<Object>} Validation result.
+ */
+async function validateGoogleReceipt(purchaseToken, packageName, productId) {
+  const auth = new google.auth.GoogleAuth({
+    keyFile: "encurage-new-18b38f50569d.json",
+    scopes: ["https://www.googleapis.com/auth/androidpublisher"],
+  });
+
+  try {
+    const response = await google
+      .androidpublisher("v3")
+      .purchases.subscriptions.get({
+        packageName: packageName,
+        subscriptionId: productId,
+        token: purchaseToken,
+        auth: auth,
+      });
+
+    // Step 2: Check acknowledgment status
+    if (response.data?.acknowledgementState === 0) {
+      // Acknowledge the purchase if not already acknowledged
+      const acknowledge = await google
+        .androidpublisher("v3")
+        .purchases.subscriptions.acknowledge({
+          packageName: packageName,
+          subscriptionId: productId,
+          token: purchaseToken,
+          auth: auth,
+        });
+
+      logger.log("acknowledge", acknowledge);
+      logger.log(
+        "Purchase acknowledged successfully for token:",
+        purchaseToken
+      );
+    }
+    logger.log("validateGoogleReceipt response", response);
+    return response.data;
+  } catch (error) {
+    logger.error("Google receipt validation failed:", error);
+    throw error;
+  }
+}
+
+// ****************************************************** End Subscription ********************************
+
+// ****************************************************** Start Data Migration ********************************
+
 exports.convertOnCureUser = v1.https.onCall(async (data, context) => {
   const { appVersion } = data;
-  console.log("data", data);
-  console.log("context.auth", context.auth);
   if (!context.auth) {
     throw new v1.https.HttpsError(
       "unauthenticated",
@@ -1886,11 +1963,9 @@ exports.convertOnCureUser = v1.https.onCall(async (data, context) => {
       string,
       ChildData
     >;
-
-    // 3) Build array of child IDs
     const childIds = Object.keys(childrenData);
 
-    // 4) Transform old user data -> new user
+    // 3) Transform old user data -> new user
     const email = context.auth.token.email;
     const newUser = transformOnCureUser(
       oldUserData,
@@ -1900,29 +1975,28 @@ exports.convertOnCureUser = v1.https.onCall(async (data, context) => {
       appVersion
     );
 
-    // 5) Transform each child
+    // 4) Prepare big updates object
     const updates: Record<string, any> = {};
-    updates[`/users/${userId}`] = newUser;
+    updates[`/users/${userId}`] = { ...newUser, converted: true };
 
-    for (const [childId, childObject] of Object.entries(childrenData)) {
-      const transformedChild = transformOnCureChild(
-        childObject,
+    // 5) For each child, transform & migrate child + old symptoms
+    for (const [childId, childObj] of Object.entries(childrenData)) {
+      const childUpdates = await transformAndMigrateChild(
+        childObj,
         childId,
         appVersion
       );
-      updates[`/children/${childId}`] = transformedChild;
+      Object.assign(updates, childUpdates);
     }
 
-    // 6) Write to DB
+    // 6) Write all at once
     await db.ref().update(updates);
 
     // Return result
     return {
+      message: "Success",
       user: newUser,
-      children: Object.entries(childrenData).map(([childId, childVal]) => ({
-        ...transformOnCureChild(childVal, childId, appVersion),
-        id: childId,
-      })),
+      childrenCount: childIds.length,
     };
   } catch (error) {
     console.error("Error in convertOnCureUser:", error);
@@ -2003,6 +2077,55 @@ function transformOnCureUser(
   // 6) Return the final object. You could cast to `User` if you like,
   //    but remember we are keeping extra old fields.
   return newUser;
+}
+
+async function transformAndMigrateChild(
+  oldChildData: any,
+  childId: string,
+  appVersion: string
+): Promise<Record<string, any>> {
+  // 1) Transform the child’s core data
+  const newChild = transformOnCureChild(oldChildData, childId, appVersion); // your existing function
+
+  // 2) Fetch old symptoms for this child
+  const symptomSnap = await onCureDb
+    .ref("/symptom")
+    .orderByChild("child_id")
+    .equalTo(childId)
+    .once("value");
+  const oldSymptomData = symptomSnap.val() || {};
+
+  // 3) Get or create the "general" folder in the new DB
+  const folder = await getOrCreateGeneralFolder(childId);
+
+  // 4) Transform each old symptom -> new tracking doc
+  //    Build up a set of multi-loc updates
+  const multiLocUpdates: Record<string, any> = {};
+
+  // (a) The child itself goes under /children/{childId}
+  multiLocUpdates[`/children/${childId}`] = newChild;
+
+  // (b) For each old symptom doc:
+  for (const [symptomKey, symptomObj] of Object.entries(oldSymptomData)) {
+    // transformSymptomToTracking expects oldSymptom, childId, folder
+    const newTracking = transformSymptomToTracking(
+      symptomObj,
+      childId,
+      folder,
+      symptomKey
+    );
+
+    // We'll store the new tracking doc under /tracking/{childId}/{trackingId}
+    if (!symptomKey) {
+      // if for some reason we failed to get an ID
+      newTracking.id = db.ref().push().key;
+    }
+    const trackingPath = `/tracking/${childId}/${symptomKey}`;
+    multiLocUpdates[trackingPath] = newTracking;
+  }
+
+  // return the updates object
+  return multiLocUpdates;
 }
 
 /**
@@ -2199,79 +2322,189 @@ function getIbuprofenValue(index: number): string {
 }
 
 /**
- * Validates an Apple receipt.
- * @param {string} receipt - Base64-encoded receipt.
- * @returns {Promise<Object>} Validation result.
+ * Gets or creates the "general" folder for a given child in the new DB.
+ * @param childId The child's ID
+ * @returns An object { id, name, createdAt }
  */
-async function validateAppleReceipt(receipt) {
-  const sharedSecret = v1.config().appstore.shared_secret;
+async function getOrCreateGeneralFolder(childId: string) {
+  // 1) Reference to /folders/{childId}
+  const folderRef = db.ref(`/folders/${childId}`);
 
-  const body = {
-    "receipt-data": receipt,
-    password: sharedSecret, // Replace with your App Store shared secret
+  // 2) Fetch all folders
+  const folderSnap = await folderRef.once("value");
+  const folderData = folderSnap.val() || {};
+
+  // 3) Try to find a folder whose name === 'general'
+  for (const [folderId, folderObj] of Object.entries(folderData)) {
+    if ((folderObj as any).name === "general") {
+      // Found it, return existing
+      return {
+        id: folderId,
+        name: "general",
+        createdAt: (folderObj as any).createdAt || Date.now(),
+      };
+    }
+  }
+
+  // 4) If not found, create a new folder with push ID
+  const newFolderRef = folderRef.push();
+  const newFolderId = newFolderRef.key;
+  const createdAt = Date.now();
+
+  if (!newFolderId) {
+    throw new Error("Failed to create new folder ID");
+  }
+
+  const newFolderObj = {
+    id: newFolderId,
+    name: "general",
+    createdAt,
   };
 
-  try {
-    let response = await axios.post(APPLE_RECEIPT_VALIDATION_URL, body);
-    // If the environment is sandbox, retry with the sandbox URL
-    if (response.data.status === 21007) {
-      response = await axios.post(APPLE_SANDBOX_URL, body);
-    }
-    return response.data;
-  } catch (error) {
-    logger.error("Apple receipt validation failed:", error);
-    throw error;
-  }
+  await newFolderRef.set(newFolderObj);
+
+  return {
+    id: newFolderId,
+    name: "general",
+    createdAt,
+  };
 }
 
 /**
- * Validates a Google Play receipt.
- * @param {string} purchaseToken - The purchase token from the client.
- * @param {string} packageName - The app package name.
- * @param {string} productId - The product ID of the subscription or in-app item.
- * @returns {Promise<Object>} Validation result.
+ * Transform an old symptom record into a new "Tracking" shape.
+ *
+ * @param oldSymptom A single record from the old "symptom" node
+ * @param childId The child's ID (same as oldSymptom.child_id)
+ * @param folderData The {id, name, createdAt} object for the folder
  */
-async function validateGoogleReceipt(purchaseToken, packageName, productId) {
-  const auth = new google.auth.GoogleAuth({
-    keyFile: "encurage-new-18b38f50569d.json",
-    scopes: ["https://www.googleapis.com/auth/androidpublisher"],
-  });
-
-  try {
-    const response = await google
-      .androidpublisher("v3")
-      .purchases.subscriptions.get({
-        packageName: packageName,
-        subscriptionId: productId,
-        token: purchaseToken,
-        auth: auth,
-      });
-
-    // Step 2: Check acknowledgment status
-    if (response.data?.acknowledgementState === 0) {
-      // Acknowledge the purchase if not already acknowledged
-      const acknowledge = await google
-        .androidpublisher("v3")
-        .purchases.subscriptions.acknowledge({
-          packageName: packageName,
-          subscriptionId: productId,
-          token: purchaseToken,
-          auth: auth,
-        });
-
-      logger.log("acknowledge", acknowledge);
-      logger.log(
-        "Purchase acknowledged successfully for token:",
-        purchaseToken
-      );
+function transformSymptomToTracking(
+  oldSymptom: any,
+  childId: string,
+  folderData: { id: string; name: string; createdAt: number },
+  symptomKey: string
+) {
+  // 1. Convert startDate -> epoch time
+  let epochTime = Date.now();
+  if (typeof oldSymptom.startDate === "string") {
+    const d = new Date(oldSymptom.startDate);
+    if (!isNaN(d.valueOf())) {
+      epochTime = d.getTime();
     }
-    logger.log("validateGoogleReceipt response", response);
-    return response.data;
-  } catch (error) {
-    logger.error("Google receipt validation failed:", error);
-    throw error;
   }
+
+  // 2. Determine the old symptomType, default to "custom" if missing
+  const oldType = oldSymptom.symptomType || "custom";
+
+  // 3. Find a new symptom key in the map or default to "other"
+  const newSymptomKey = SYMPTOM_TYPE_MAP[oldType] || "other";
+
+  // 5. Build the symptom entry
+  //    We'll copy leftover fields (like eventId, etc.) but skip severity & temperature if missing.
+  const symptomEntry: any = {
+    dateTime: epochTime,
+    // Keep a "symptomName" to preserve the old type (or customSymptomName).
+    symptomName: oldSymptom.customSymptomName || oldType,
+  };
+
+  // 6. If oldSymptom.severityScale exists, add severity; otherwise skip.
+  if (oldSymptom.severityScale) {
+    symptomEntry.severity = oldSymptom.severityScale;
+  }
+
+  if (oldSymptom.notes) {
+    symptomEntry.notes = oldSymptom.notes;
+  }
+
+  // 7. If oldType === 'fever' and temperature is defined, map temperature -> value; add degree:'f'
+  if (oldType === "fever" && oldSymptom.temperature !== undefined) {
+    const tempRounded = Math.round(oldSymptom.temperature * 10) / 10;
+    symptomEntry.value = String(tempRounded);
+    symptomEntry.degree = "f";
+  }
+
+  // 8. Copy over additional fields that we haven't already mapped
+  //    so we don't lose them. We'll exclude keys we explicitly handled above.
+  const handledKeys = new Set([
+    "child_id",
+    "id",
+    "symptomType",
+    "customSymptomName",
+    "startDate",
+    "notes",
+    "severityScale",
+    "apiVersion",
+    "temperature", // avoid duplicating since we mapped it to `value`
+  ]);
+
+  for (const [key, value] of Object.entries(oldSymptom)) {
+    if (!handledKeys.has(key)) {
+      symptomEntry[key] = value;
+    }
+  }
+
+  // Use the oldSymptom's ID, or the symptomKey, or create a new push key
+  const trackingId = symptomKey || oldSymptom.id || db.ref().push().key;
+
+  // 9. Construct the final "Tracking" object
+  const newTracking = {
+    id: trackingId,
+    childId,
+    trackingType: "symptoms",
+    createdAt: epochTime,
+    data: {
+      dateTime: epochTime,
+      symptoms: {
+        [newSymptomKey]: symptomEntry,
+      },
+    },
+    folder: {
+      id: folderData.id,
+      name: folderData.name,
+      createdAt: folderData.createdAt,
+    },
+  };
+
+  return newTracking;
 }
+
+// A partial example. Fill in carefully using your best matches.
+const SYMPTOM_TYPE_MAP: Record<string, string> = {
+  fever: "Temperature",
+  cough: "Cough",
+  congestion: "Congestion or Runny Nose",
+  wheezing: "Wheezing",
+  soreThroat: "Sore Throat",
+  headache: "Headache",
+  earAche: "Other", // no direct match in your new list, so "other"
+  painfulUrination: "Other", // or maybe "frequentUrination"? If that's closer?
+  constipation: "Constipation",
+  diarrhea: "Diarrhea",
+  vomiting: "Vomiting",
+  rash: "Rash",
+  spittingUp: "other", // no direct match
+  pain: "Pain", // or "abdominalPain"? depends on your preferences
+  stomachAche: "Other",
+  fatigue: "Fatigue or Energy Loss",
+  nausea: "Nausea",
+  shortageOfBreath: "Shortage of Breath",
+  eyeIssues: "Other", // maybe "dryEyes"? If it’s not perfect, you could do "other"
+  // If there's "custom" or anything else not in this map → "other"
+};
+
+// async function saveTrackingRecord(newTracking: any) {
+//   // newTracking.childId, newTracking.id are set
+//   const { childId, id } = newTracking;
+//   if (!childId) throw new Error("No childId in newTracking object");
+
+//   // If you want to reuse oldSymptom.id as the key:
+//   const trackingId = id || db.ref().push().key;
+
+//   // Path: /tracking/{childId}/{trackingId}
+//   const refPath = `/tracking/${childId}/${trackingId}`;
+//   await db.ref(refPath).set(newTracking);
+// }
+
+// ****************************************************** End Data Migration ********************************
 
 type Doses = {
   id: string;
