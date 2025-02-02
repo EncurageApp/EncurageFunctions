@@ -1855,6 +1855,7 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
 });
 
 exports.convertOnCureUser = v1.https.onCall(async (data, context) => {
+  const { appVersion } = data;
   console.log("data", data);
   console.log("context.auth", context.auth);
   if (!context.auth) {
@@ -1891,14 +1892,24 @@ exports.convertOnCureUser = v1.https.onCall(async (data, context) => {
 
     // 4) Transform old user data -> new user
     const email = context.auth.token.email;
-    const newUser = transformOnCureUser(oldUserData, userId, email, childIds);
+    const newUser = transformOnCureUser(
+      oldUserData,
+      userId,
+      email,
+      childIds,
+      appVersion
+    );
 
     // 5) Transform each child
     const updates: Record<string, any> = {};
     updates[`/users/${userId}`] = newUser;
 
     for (const [childId, childObject] of Object.entries(childrenData)) {
-      const transformedChild = transformOnCureChild(childObject, childId);
+      const transformedChild = transformOnCureChild(
+        childObject,
+        childId,
+        appVersion
+      );
       updates[`/children/${childId}`] = transformedChild;
     }
 
@@ -1909,7 +1920,7 @@ exports.convertOnCureUser = v1.https.onCall(async (data, context) => {
     return {
       user: newUser,
       children: Object.entries(childrenData).map(([childId, childVal]) => ({
-        ...transformOnCureChild(childVal, childId),
+        ...transformOnCureChild(childVal, childId, appVersion),
         id: childId,
       })),
     };
@@ -1934,7 +1945,8 @@ function transformOnCureUser(
   oldData: any,
   userId: string,
   email: string | undefined,
-  childrenIds: string[]
+  childrenIds: string[],
+  appVersion: string | undefined
 ) {
   // 1) Start by shallow-copying all fields from the old data
   //    so we keep anything that doesn’t match the new model.
@@ -1945,7 +1957,7 @@ function transformOnCureUser(
   newUser.email = email ?? ""; // Might be empty if not found
   newUser.children = childrenIds; // The array of child IDs
   newUser.agreeToTerm = false; // Default false if not found
-  newUser.authType = "unknown"; // Example default; customize as needed
+  newUser.authType = "email"; // Example default; customize as needed
 
   // 3) Handle renamed fields
   if (typeof newUser.first_name === "string") {
@@ -1957,7 +1969,7 @@ function transformOnCureUser(
     delete newUser.last_name;
   }
   if (typeof newUser.apiVersion === "string") {
-    newUser.appVersion = newUser.apiVersion;
+    newUser.appVersion = appVersion;
     delete newUser.apiVersion;
   }
 
@@ -1998,7 +2010,11 @@ function transformOnCureUser(
  * @param oldChildData - The original child object from onCureDb
  * @param childId - The key/ID in the old DB (must remain the same).
  */
-function transformOnCureChild(oldChildData: any, childId: string): any {
+function transformOnCureChild(
+  oldChildData: any,
+  childId: string,
+  appVersion: string
+): any {
   // 1. Start with a shallow copy so we keep any fields not in the new model
   const newChild: any = { ...oldChildData };
 
@@ -2008,38 +2024,178 @@ function transformOnCureChild(oldChildData: any, childId: string): any {
     delete newChild.full_name;
   }
 
-  // 3. Rename `dob` -> `childBDay`, convert the string to epoch time
+  // 3. Rename `dob` -> `childBDay`, convert string to epoch time
   if (typeof newChild.dob === "string") {
     const dateObj = new Date(newChild.dob);
-    if (!isNaN(dateObj.valueOf())) {
-      newChild.childBDay = dateObj.getTime(); // e.g., 1688079463000
-    } else {
-      // If parsing fails, you could default to 0 or remove the field
-      newChild.childBDay = 0;
-    }
+    newChild.childBDay = !isNaN(dateObj.valueOf()) ? dateObj.getTime() : 0;
     delete newChild.dob;
   }
 
-  // 4. If `parent_id` exists, rename -> `parentId`
+  // 4. Rename `parent_id` -> `parentId`
   if (typeof newChild.parent_id === "string") {
     newChild.parentId = newChild.parent_id;
     delete newChild.parent_id;
   }
 
-  // 5. Map `weight` -> `weightUnitMajor`, round down
+  // 5. Convert weight => weightUnitMajor (string) + set weightUnit if weight present
   if (typeof newChild.weight === "number") {
-    newChild.weightUnitMajor = Math.floor(newChild.weight); // remove decimals
-    delete newChild.weight; // remove old field if you wish
+    newChild.weightUnitMajor = String(Math.floor(newChild.weight));
+    newChild.weightUnit = "lbs";
+    delete newChild.weight;
   }
 
-  // 6. Hardcode weightUnit to 'lbs'
-  newChild.weightUnit = "lbs";
+  // 6. Build the `dosages` object from the old user_defined_* fields
+  //    We'll store today's date in epoch time
+  const now = Date.now();
 
-  // 7. Retain the child’s ID
+  // Get numeric indexes (should always exist, per your spec)
+  const acetIndex = Number(newChild.user_defined_acetaminophen_dose);
+  const ibuIndex = Number(newChild.user_defined_ibuprofen_dose);
+
+  // Map them to the new dose values
+  const acetaminophenDoseValue = getAcetaminophenValue(acetIndex);
+  const ibuprofenDoseValue = getIbuprofenValue(ibuIndex);
+
+  // Create the `dosages` object
+  newChild.dosages = {
+    acetaminophen: {
+      dateAdded: now,
+      dose: acetaminophenDoseValue,
+      maxDose: "5",
+      name: "Acetaminophen",
+      timeGap: "4",
+    },
+    ibuprofen: {
+      dateAdded: now,
+      dose: ibuprofenDoseValue,
+      maxDose: "4",
+      name: "Ibuprofen",
+      timeGap: "6",
+    },
+    alternating: {
+      dateAdded: now,
+      name: "Alternating",
+      timeGap: "3",
+    },
+  };
+
+  // 7. If the mapped dose is "other", check if the old dose_text field is present
+  if (acetaminophenDoseValue === "other") {
+    const oldAcetText = newChild.user_defined_acetaminophen_dose_text;
+    if (typeof oldAcetText === "string" && oldAcetText.trim() !== "") {
+      newChild.dosages.acetaminophen.doseOther = oldAcetText;
+    }
+  }
+  if (ibuprofenDoseValue === "other") {
+    const oldIbuText = newChild.user_defined_ibuprofen_dose_text;
+    if (typeof oldIbuText === "string" && oldIbuText.trim() !== "") {
+      newChild.dosages.ibuprofen.doseOther = oldIbuText;
+    }
+  }
+
+  // Optionally, remove the old fields if you don't need them anymore
+  delete newChild.user_defined_acetaminophen_dose;
+  delete newChild.user_defined_acetaminophen_dose_text; // sometimes present
+  delete newChild.user_defined_ibuprofen_dose;
+  delete newChild.user_defined_ibuprofen_dose_text; // sometimes present
+
+  // 8. Retain the child’s ID
   newChild.childId = childId;
 
-  // Return the transformed object
+  // add app version
+  if (typeof newChild.apiVersion === "string") {
+    newChild.appVersion = appVersion;
+    delete newChild.apiVersion;
+  }
+
   return newChild;
+}
+
+// For acetaminophen:
+const acetaminophenDose = [
+  { label: "1.25 mL infant’s suspension", value: "125ml" },
+  { label: "2.5 mL infant’s suspension", value: "25ml" },
+  { label: "3.75 mL infant’s suspension", value: "375ml" },
+  {
+    label: "5 mL children’s suspension - OR - 1 chewable tablet of 160 mg",
+    value: "5ml",
+  },
+  {
+    label: "7.5 mL children’s suspension - OR - 1.5 chewable tablets of 160mg",
+    value: "75ml",
+  },
+  {
+    label: "10 mL children’s suspension - OR - 2 chewable tablets of 160mg",
+    value: "10ml",
+  },
+  {
+    label: "12.5 mL children’s suspension - OR - 2.5 chewable tablets of 160mg",
+    value: "125ml",
+  },
+  {
+    label: "15 mL children’s suspension - OR - 3 chewable tablets of 160mg",
+    value: "15ml",
+  },
+  {
+    label:
+      "20 mL children’s suspension - OR - 4 chewable tablets of 160mg each",
+    value: "20ml",
+  },
+  { label: "Other", value: "other" },
+];
+
+// For ibuprofen:
+const ibuprofenDose = [
+  { label: "1.25 mL Infant Drops", value: "1.25ml" },
+  { label: "1.875 mL Infant Drops", value: "1875ml" },
+  {
+    label: "5 mL Children's Suspension - OR - 1 chewable tablets of 100 mg",
+    value: "5ml",
+  },
+  {
+    label: "7.5 mL Children's Suspension - OR - 1.5 chewable tablets of 100 mg",
+    value: "75ml",
+  },
+  {
+    label: "10 mL Children's Suspension - OR - 2 chewable tablets of 100 mg",
+    value: "10ml",
+  },
+  {
+    label:
+      "12.5 mL Children's Suspension - OR - 2.5 chewable tablets of 100 mg",
+    value: "125ml",
+  },
+  {
+    label: "15 mL Children's Suspension - OR - 3 chewable tablets of 100 mg",
+    value: "15ml",
+  },
+  {
+    label: "20 mL Children's Suspension - OR - 4 chewable tablets of 100 mg",
+    value: "20ml",
+  },
+  { label: "Other", value: "other" },
+];
+
+/**
+ * Returns the `value` string for the given acetaminophen dose index.
+ * If out of range, defaults to 'other'.
+ */
+function getAcetaminophenValue(index: number): string {
+  if (index >= 0 && index < acetaminophenDose.length) {
+    return acetaminophenDose[index].value;
+  }
+  return "other"; // fallback
+}
+
+/**
+ * Returns the `value` string for the given ibuprofen dose index.
+ * If out of range, defaults to 'other'.
+ */
+function getIbuprofenValue(index: number): string {
+  if (index >= 0 && index < ibuprofenDose.length) {
+    return ibuprofenDose[index].value;
+  }
+  return "other"; // fallback
 }
 
 /**
@@ -2154,8 +2310,27 @@ type ChildData = {
   // healthCareProviders?: DoctorType[];
   // conditions?: ConditionType[];
   // medications?: MedicationType[];
-  // dosages?: DosageType; // Changed type to DosageType
+  dosages?: DosageType; // Changed type to DosageType
   eventIds?: string[];
   careFamilyId?: string;
   careFamily?: any;
+};
+
+type DosageType = {
+  [key: string]: AsNeededDoseType | undefined; // Use a generic object type
+};
+
+type AsNeededDoseType = {
+  dose: string;
+  doseOther?: string | undefined;
+  unit?: string;
+  unitOther?: string;
+  form?: string;
+  formOther?: string;
+  timeGap: string;
+  maxDose: string;
+  dateAdded?: number;
+  dateUpdated?: number;
+  name?: string;
+  description?: string;
 };
