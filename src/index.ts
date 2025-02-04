@@ -1965,7 +1965,7 @@ exports.convertOnCureUser = v1.https.onCall(async (data, context) => {
     >;
     const childIds = Object.keys(childrenData);
 
-    // 3) Transform old user data -> new user
+    // 3) Transform user
     const email = context.auth.token.email;
     const newUser = transformOnCureUser(
       oldUserData,
@@ -1975,24 +1975,28 @@ exports.convertOnCureUser = v1.https.onCall(async (data, context) => {
       appVersion
     );
 
-    // 4) Prepare big updates object
+    // 4) Prepare big updates
     const updates: Record<string, any> = {};
     updates[`/users/${userId}`] = { ...newUser, converted: true };
 
     // 5) For each child, transform & migrate child + old symptoms
     for (const [childId, childObj] of Object.entries(childrenData)) {
+      // A) Migrate child + symptoms
       const childUpdates = await transformAndMigrateChild(
         childObj,
         childId,
         appVersion
       );
       Object.assign(updates, childUpdates);
+
+      // B) Migrate old journals for this child
+      const journalUpdates = await migrateJournalsForChild(childId);
+      Object.assign(updates, journalUpdates);
     }
 
     // 6) Write all at once
     await db.ref().update(updates);
 
-    // Return result
     return {
       message: "Success",
       user: newUser,
@@ -2095,36 +2099,56 @@ async function transformAndMigrateChild(
     .once("value");
   const oldSymptomData = symptomSnap.val() || {};
 
-  // 3) Get or create the "general" folder in the new DB
+  // 3) Get/create folder
   const folder = await getOrCreateGeneralFolder(childId);
 
-  // 4) Transform each old symptom -> new tracking doc
-  //    Build up a set of multi-loc updates
+  // 4) Build multi-loc updates
   const multiLocUpdates: Record<string, any> = {};
 
-  // (a) The child itself goes under /children/{childId}
+  // (a) The child itself
   multiLocUpdates[`/children/${childId}`] = newChild;
 
-  // (b) For each old symptom doc:
-  for (const [symptomKey, symptomObj] of Object.entries(oldSymptomData)) {
-    // transformSymptomToTracking expects oldSymptom, childId, folder
-    const newTracking = transformSymptomToTracking(
-      symptomObj,
-      childId,
-      folder,
-      symptomKey
-    );
+  // (b) Group old symptoms by startDate
+  const groupedMap = groupSymptomsByDate(oldSymptomData); // from step #1 above
 
-    // We'll store the new tracking doc under /tracking/{childId}/{trackingId}
-    if (!symptomKey) {
-      // if for some reason we failed to get an ID
-      newTracking.id = db.ref().push().key;
+  // (c) For each group => build one tracking doc with multiple symptoms
+  for (const [epochTimeStr, symptomArray] of Object.entries(groupedMap)) {
+    const epochTime = Number(epochTimeStr);
+
+    // pick an ID from the first symptom
+    const firstSym = symptomArray[0];
+    const docId = firstSym.id || firstSym.symptomKey || db.ref().push().key;
+
+    const newTracking: any = {
+      id: docId,
+      childId,
+      trackingType: "symptoms",
+      createdAt: epochTime, // or Date.now(), but typically we use the group's time
+      data: {
+        dateTime: epochTime,
+        symptoms: {},
+      },
+      folder: {
+        id: folder.id,
+        name: folder.name,
+        createdAt: folder.createdAt,
+      },
+    };
+
+    // (d) For each oldSymptom in symptomArray => transform fields & add
+    for (const oldSym of symptomArray) {
+      const { newSymptomKey, symptomEntry } =
+        transformSymptomFieldsOnly(oldSym);
+      // put them in the doc
+      symptomEntry.dateTime = epochTime; // set to group time if desired
+      newTracking.data.symptoms[newSymptomKey] = symptomEntry;
     }
-    const trackingPath = `/tracking/${childId}/${symptomKey}`;
+
+    // (e) store in multiLocUpdates
+    const trackingPath = `/tracking/${childId}/${newTracking.id}`;
     multiLocUpdates[trackingPath] = newTracking;
   }
 
-  // return the updates object
   return multiLocUpdates;
 }
 
@@ -2232,6 +2256,85 @@ function transformOnCureChild(
   }
 
   return newChild;
+}
+
+//************* Symptoms ******************/
+function groupSymptomsByDate(
+  oldSymptomData: Record<string, any>
+): Record<number, any[]> {
+  // We'll create a map of epochTime -> array of old symptom objects
+  const grouped: Record<number, any[]> = {};
+
+  for (const [symptomKey, symptomObj] of Object.entries(oldSymptomData)) {
+    // Convert startDate to an epoch time (rounded, if needed)
+    let epochTime = Date.now();
+    if (typeof symptomObj.startDate === "string") {
+      const d = new Date(symptomObj.startDate);
+      if (!isNaN(d.valueOf())) {
+        epochTime = d.getTime();
+      }
+    }
+    // Add to the map
+    if (!grouped[epochTime]) {
+      grouped[epochTime] = [];
+    }
+    grouped[epochTime].push({ symptomKey, ...symptomObj });
+  }
+
+  return grouped;
+}
+
+function transformSymptomFieldsOnly(oldSymptom: any) {
+  // 1) Determine the old symptomType, default to "custom"
+  const oldType = oldSymptom.symptomType || "custom";
+
+  // 2) Map to newSymptomKey
+  const newSymptomKey = SYMPTOM_TYPE_MAP[oldType] || "other";
+
+  // 3) parse notes, severity, etc.
+  //    For grouping, we won't handle dateTime or createdAt here,
+  //    because we want a single dateTime for the group doc.
+  const symptomEntry: any = {
+    symptomName: oldSymptom.customSymptomName || oldType,
+  };
+
+  // if severityScale is present
+  if (oldSymptom.severityScale) {
+    symptomEntry.severity = oldSymptom.severityScale;
+  }
+
+  // if notes is present
+  if (oldSymptom.notes) {
+    symptomEntry.notes = oldSymptom.notes;
+  }
+
+  // if oldType === 'fever'
+  if (oldType === "fever" && typeof oldSymptom.temperature === "number") {
+    const tempRounded = Math.round(oldSymptom.temperature * 10) / 10;
+    symptomEntry.value = String(tempRounded);
+    symptomEntry.degree = "f";
+  }
+
+  // optional leftover fields
+  const handledKeys = new Set([
+    "child_id",
+    "id",
+    "symptomType",
+    "customSymptomName",
+    "startDate",
+    "notes",
+    "severityScale",
+    "apiVersion",
+    "temperature",
+  ]);
+  for (const [key, value] of Object.entries(oldSymptom)) {
+    if (!handledKeys.has(key)) {
+      symptomEntry[key] = value;
+    }
+  }
+
+  // Return just the key + partial object
+  return { newSymptomKey, symptomEntry };
 }
 
 // For acetaminophen:
@@ -2370,104 +2473,6 @@ async function getOrCreateGeneralFolder(childId: string) {
   };
 }
 
-/**
- * Transform an old symptom record into a new "Tracking" shape.
- *
- * @param oldSymptom A single record from the old "symptom" node
- * @param childId The child's ID (same as oldSymptom.child_id)
- * @param folderData The {id, name, createdAt} object for the folder
- */
-function transformSymptomToTracking(
-  oldSymptom: any,
-  childId: string,
-  folderData: { id: string; name: string; createdAt: number },
-  symptomKey: string
-) {
-  // 1. Convert startDate -> epoch time
-  let epochTime = Date.now();
-  if (typeof oldSymptom.startDate === "string") {
-    const d = new Date(oldSymptom.startDate);
-    if (!isNaN(d.valueOf())) {
-      epochTime = d.getTime();
-    }
-  }
-
-  // 2. Determine the old symptomType, default to "custom" if missing
-  const oldType = oldSymptom.symptomType || "custom";
-
-  // 3. Find a new symptom key in the map or default to "other"
-  const newSymptomKey = SYMPTOM_TYPE_MAP[oldType] || "other";
-
-  // 5. Build the symptom entry
-  //    We'll copy leftover fields (like eventId, etc.) but skip severity & temperature if missing.
-  const symptomEntry: any = {
-    dateTime: epochTime,
-    // Keep a "symptomName" to preserve the old type (or customSymptomName).
-    symptomName: oldSymptom.customSymptomName || oldType,
-  };
-
-  // 6. If oldSymptom.severityScale exists, add severity; otherwise skip.
-  if (oldSymptom.severityScale) {
-    symptomEntry.severity = oldSymptom.severityScale;
-  }
-
-  if (oldSymptom.notes) {
-    symptomEntry.notes = oldSymptom.notes;
-  }
-
-  // 7. If oldType === 'fever' and temperature is defined, map temperature -> value; add degree:'f'
-  if (oldType === "fever" && oldSymptom.temperature !== undefined) {
-    const tempRounded = Math.round(oldSymptom.temperature * 10) / 10;
-    symptomEntry.value = String(tempRounded);
-    symptomEntry.degree = "f";
-  }
-
-  // 8. Copy over additional fields that we haven't already mapped
-  //    so we don't lose them. We'll exclude keys we explicitly handled above.
-  const handledKeys = new Set([
-    "child_id",
-    "id",
-    "symptomType",
-    "customSymptomName",
-    "startDate",
-    "notes",
-    "severityScale",
-    "apiVersion",
-    "temperature", // avoid duplicating since we mapped it to `value`
-  ]);
-
-  for (const [key, value] of Object.entries(oldSymptom)) {
-    if (!handledKeys.has(key)) {
-      symptomEntry[key] = value;
-    }
-  }
-
-  // Use the oldSymptom's ID, or the symptomKey, or create a new push key
-  const trackingId = symptomKey || oldSymptom.id || db.ref().push().key;
-
-  // 9. Construct the final "Tracking" object
-  const newTracking = {
-    id: trackingId,
-    childId,
-    trackingType: "symptoms",
-    createdAt: epochTime,
-    data: {
-      dateTime: epochTime,
-      symptoms: {
-        [newSymptomKey]: symptomEntry,
-      },
-    },
-    folder: {
-      id: folderData.id,
-      name: folderData.name,
-      createdAt: folderData.createdAt,
-    },
-  };
-
-  return newTracking;
-}
-
-// A partial example. Fill in carefully using your best matches.
 const SYMPTOM_TYPE_MAP: Record<string, string> = {
   fever: "Temperature",
   cough: "Cough",
@@ -2491,18 +2496,277 @@ const SYMPTOM_TYPE_MAP: Record<string, string> = {
   // If there's "custom" or anything else not in this map → "other"
 };
 
-// async function saveTrackingRecord(newTracking: any) {
-//   // newTracking.childId, newTracking.id are set
-//   const { childId, id } = newTracking;
-//   if (!childId) throw new Error("No childId in newTracking object");
+//************* Journal ******************/
 
-//   // If you want to reuse oldSymptom.id as the key:
-//   const trackingId = id || db.ref().push().key;
+async function migrateJournalsForChild(
+  childId: string
+): Promise<Record<string, any>> {
+  // 1) Fetch old journal entries
+  const snap = await onCureDb.ref(`/journals/${childId}/entries`).once("value");
+  const oldEntries = snap.val() || {};
 
-//   // Path: /tracking/{childId}/{trackingId}
-//   const refPath = `/tracking/${childId}/${trackingId}`;
-//   await db.ref(refPath).set(newTracking);
-// }
+  // If oldEntries is an object of key => entry, convert to array
+  // or just iterate over them
+  const updates: Record<string, any> = {};
+
+  // 2) Get or create the 'general' folder
+  const folderObj = await getOrCreateGeneralFolder(childId);
+
+  for (const [oldKey, oldEntry] of Object.entries(oldEntries)) {
+    logger.log("oldKey", oldKey);
+    // oldEntry has fields like { appetite, date, energyLevels, ... }
+    // oldEntry.id might exist or we can use `oldKey`
+
+    // 3) Build the new doc
+    const newDoc = buildJournalDoc(childId, folderObj, oldEntry, oldKey);
+
+    // 4) Decide your path: /tracking/{childId}/{docId}
+    const docPath = `/journal/${childId}/${newDoc.id}`;
+    updates[docPath] = newDoc;
+  }
+
+  return updates;
+}
+
+function buildJournalDoc(
+  childId: string,
+  folderObj: { id: string; name: string; createdAt: number },
+  oldEntry: any,
+  oldKey: string
+) {
+  // 1) transform core fields => data
+  const journalData = transformJournalEntry(oldEntry);
+
+  // 2) pick doc ID from old entry or push key
+  const docId = oldKey || db.ref().push().key;
+
+  let epochTime = Date.now();
+  if (typeof oldEntry.date === "number") {
+    // For example, if it's something like 625091638.699627 (which looks like seconds from 1970)
+    // you might do:
+    epochTime = Math.round((oldEntry.date + 978307200) * 1000);
+  }
+
+  // 3) build final
+  const newJournalDoc: any = {
+    id: docId,
+    childId,
+    createdAt: epochTime, // or use the same epoch as data.dateTime
+    updatedAt: Date.now(),
+    data: journalData, // { dateTime, subjects: { ... } }
+    folder: {
+      id: folderObj.id,
+      name: folderObj.name,
+      createdAt: folderObj.createdAt,
+    },
+  };
+
+  return newJournalDoc;
+}
+
+function transformJournalEntry(oldEntry: any): any {
+  // We'll build a "subjects" object
+  const subjects: Record<string, any> = {};
+
+  // convert old "date" (which might be a float) to an integer epoch
+  // if the old date is in seconds, multiply by 1000 to get ms
+  let epochTime = Date.now();
+  if (typeof oldEntry.date === "number") {
+    // For example, if it's something like 625091638.699627 (which looks like seconds from 1970)
+    // you might do:
+    epochTime = Math.round((oldEntry.date + 978307200) * 1000);
+  }
+
+  // We'll store these in subjects
+  // Example: energyLevels:4 => subjects.energy = { dateTime: epochTime, energy: 'slightlyLow' }
+  // You can define a numeric scale => label map
+  if (oldEntry.appetite !== undefined) {
+    subjects.appetite = {
+      dateTime: epochTime,
+      appetite: mapAppetite(oldEntry.appetite),
+    };
+  }
+
+  if (oldEntry.energyLevels !== undefined) {
+    subjects.energy = {
+      dateTime: epochTime,
+      energy: mapEnergyLevels(oldEntry.energyLevels),
+    };
+  }
+
+  if (oldEntry.sleepDuration !== undefined) {
+    subjects.sleep = {
+      dateTime: epochTime,
+      sleepLength: mapSleepDurationLevels(oldEntry.sleepDuration),
+    };
+  }
+
+  if (oldEntry.sleepQuality !== undefined) {
+    subjects.sleep.sleepQuality = mapSleepQualityLevels(oldEntry.sleepQuality);
+  }
+
+  if (oldEntry.moodChanges !== undefined) {
+    subjects.symptomControl = {
+      dateTime: epochTime,
+      symptomControl: mapSymptomControl(oldEntry.moodChanges),
+      symptomName: "Mood Change",
+    };
+  }
+
+  if (oldEntry.generalMood !== undefined) {
+    subjects.emotionalWellbeingMood = {
+      dateTime: epochTime,
+      notes: mapEmotional(oldEntry.generalMood),
+    };
+  }
+
+  if (oldEntry.improvement !== undefined) {
+    const note = oldEntry?.notes ? oldEntry?.notes : "";
+    subjects.other = {
+      dateTime: epochTime,
+      name: "Overall improvement",
+      notes: `${mapOverall(oldEntry.sleepQuality)}
+      ${note}`,
+    };
+  }
+
+  return {
+    dateTime: epochTime,
+    subjects,
+  };
+}
+
+// example scale mappers
+function mapAppetite(num: number): string {
+  switch (num) {
+    case 0:
+      return "extremelyDecreased";
+    case 1:
+      return "somewhatDecreased";
+    case 2:
+      return "somewhatDecreased";
+    case 3:
+      return "regular";
+    case 4:
+      return "somewhatIncreased";
+    case 5:
+      return "somewhatIncreased";
+    case 6:
+      return "extremelyIncreased";
+    default:
+      return "unknown";
+  }
+}
+
+function mapEnergyLevels(num: number): string {
+  switch (num) {
+    case 0:
+      return "noPain";
+    case 1:
+      return "hurtsALittle";
+    case 2:
+      return "hurtsALittle";
+    case 3:
+      return "hurtsALittleMore";
+    case 4:
+      return "hurtsWholeLot";
+    case 5:
+      return "hurtsWholeLot";
+    case 6:
+      return "hurtsWorst";
+    default:
+      return "unknown";
+  }
+}
+
+function mapSleepDurationLevels(num: number): string {
+  switch (num) {
+    case 0:
+      return "extremelyShort";
+    case 1:
+      return "somewhatShort";
+    case 2:
+      return "somewhatShort";
+    case 3:
+      return "average";
+    case 4:
+      return "somewhatLong";
+    case 5:
+      return "somewhatLong";
+    case 6:
+      return "extremelyLong";
+    default:
+      return "unknown";
+  }
+}
+
+function mapSleepQualityLevels(num: number): string {
+  switch (num) {
+    case 0:
+      return "veryPoor";
+    case 1:
+      return "poor";
+    case 2:
+      return "average";
+    case 3:
+      return "good";
+    case 4:
+      return "excellent";
+    default:
+      return "unknown";
+  }
+}
+
+function mapSymptomControl(num: number): string {
+  switch (num) {
+    case 0:
+      return "none";
+    case 1:
+      return "veryLow";
+    case 2:
+      return "medium";
+    case 3:
+      return "high";
+    case 4:
+      return "veryHigh";
+    default:
+      return "unknown";
+  }
+}
+
+function mapOverall(num: number): string {
+  switch (num) {
+    case 0:
+      return "No Improvement Yet";
+    case 1:
+      return "Slight Improvement";
+    case 2:
+      return "Some Improvement";
+    case 3:
+      return "Significant Improvement";
+    case 4:
+      return "Great";
+    default:
+      return "unknown";
+  }
+}
+
+function mapEmotional(num: number): string {
+  switch (num) {
+    case 0:
+      return "Poor";
+    case 1:
+      return "Fair";
+    case 2:
+      return "Good";
+    case 3:
+      return "Very good";
+    case 4:
+      return "Excellent";
+    default:
+      return "unknown";
+  }
+}
 
 // ****************************************************** End Data Migration ********************************
 
