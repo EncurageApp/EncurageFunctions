@@ -1,7 +1,3 @@
-/**
- * See a full list of supported triggers at https://firebase.google.com/docs/functions
- */
-
 import * as v1 from "firebase-functions/v1";
 // import * as v2 from "firebase-functions/v2";
 import * as logger from "firebase-functions/logger";
@@ -10,13 +6,12 @@ import moment from "moment-timezone";
 import axios from "axios";
 import { google } from "googleapis";
 
-// admin.initializeApp();
-// const db = admin.database();
+const serviceAccount = require("../oncure-app-firebase-adminsdk-j41yq-34921b17e4.json");
+
 // 1) Default app
 admin.initializeApp(
   {
     databaseURL: "https://encurage-new-default-rtdb.firebaseio.com",
-    // plus any other config if necessary
   },
   "defaultApp"
 );
@@ -24,8 +19,8 @@ admin.initializeApp(
 // 2) Secondary app
 admin.initializeApp(
   {
-    databaseURL: "https://oncure-data.firebaseio.com",
-    // same or similar credentials if in the same project
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: "https://oncure-app.firebaseio.com/",
   },
   "onCureApp"
 );
@@ -2504,19 +2499,12 @@ async function migrateJournalsForChild(
   // 1) Fetch old journal entries
   const snap = await onCureDb.ref(`/journals/${childId}/entries`).once("value");
   const oldEntries = snap.val() || {};
-
-  // If oldEntries is an object of key => entry, convert to array
-  // or just iterate over them
   const updates: Record<string, any> = {};
 
   // 2) Get or create the 'general' folder
   const folderObj = await getOrCreateGeneralFolder(childId);
 
   for (const [oldKey, oldEntry] of Object.entries(oldEntries)) {
-    logger.log("oldKey", oldKey);
-    // oldEntry has fields like { appetite, date, energyLevels, ... }
-    // oldEntry.id might exist or we can use `oldKey`
-
     // 3) Build the new doc
     const newDoc = buildJournalDoc(childId, folderObj, oldEntry, oldKey);
 
@@ -2542,8 +2530,7 @@ function buildJournalDoc(
 
   let epochTime = Date.now();
   if (typeof oldEntry.date === "number") {
-    // For example, if it's something like 625091638.699627 (which looks like seconds from 1970)
-    // you might do:
+    // 978307200 is needed to adjust 31 years from ???
     epochTime = Math.round((oldEntry.date + 978307200) * 1000);
   }
 
@@ -2551,9 +2538,9 @@ function buildJournalDoc(
   const newJournalDoc: any = {
     id: docId,
     childId,
-    createdAt: epochTime, // or use the same epoch as data.dateTime
+    createdAt: epochTime,
     updatedAt: Date.now(),
-    data: journalData, // { dateTime, subjects: { ... } }
+    data: journalData,
     folder: {
       id: folderObj.id,
       name: folderObj.name,
@@ -2568,18 +2555,11 @@ function transformJournalEntry(oldEntry: any): any {
   // We'll build a "subjects" object
   const subjects: Record<string, any> = {};
 
-  // convert old "date" (which might be a float) to an integer epoch
-  // if the old date is in seconds, multiply by 1000 to get ms
   let epochTime = Date.now();
   if (typeof oldEntry.date === "number") {
-    // For example, if it's something like 625091638.699627 (which looks like seconds from 1970)
-    // you might do:
     epochTime = Math.round((oldEntry.date + 978307200) * 1000);
   }
 
-  // We'll store these in subjects
-  // Example: energyLevels:4 => subjects.energy = { dateTime: epochTime, energy: 'slightlyLow' }
-  // You can define a numeric scale => label map
   if (oldEntry.appetite !== undefined) {
     subjects.appetite = {
       dateTime: epochTime,
@@ -2636,7 +2616,6 @@ function transformJournalEntry(oldEntry: any): any {
   };
 }
 
-// example scale mappers
 function mapAppetite(num: number): string {
   switch (num) {
     case 0:
@@ -2804,10 +2783,7 @@ type ChildData = {
   weightUnit?: string;
   parentId?: string;
   childId?: string;
-  // healthCareProviders?: DoctorType[];
-  // conditions?: ConditionType[];
-  // medications?: MedicationType[];
-  dosages?: DosageType; // Changed type to DosageType
+  dosages?: DosageType;
   eventIds?: string[];
   careFamilyId?: string;
   careFamily?: any;
