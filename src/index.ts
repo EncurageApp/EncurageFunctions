@@ -1981,6 +1981,7 @@ exports.convertOnCureUser = v1.https.onCall(async (data, context) => {
         childObj,
         childId,
         appVersion
+        // timeZone
       );
       Object.assign(updates, childUpdates);
 
@@ -2060,7 +2061,7 @@ function transformOnCureUser(
   // 5) Check for any legacy flags
   const legacyFlags = [
     "onCure360Enabled",
-    "ongoingRxFreeTrialStartDate",
+    "ongoingRxEnabled", // double check in xcode
     "proMembershipEnabled",
     "symptomTrackerEnabled",
     "unlimitedEpisodesEnabled",
@@ -2101,7 +2102,7 @@ async function transformAndMigrateChild(
   const multiLocUpdates: Record<string, any> = {};
 
   // (a) The child itself
-  multiLocUpdates[`/children/${childId}`] = newChild;
+  // multiLocUpdates[`/children/${childId}`] = newChild;
 
   // (b) Group old symptoms by startDate
   const groupedMap = groupSymptomsByDate(oldSymptomData); // from step #1 above
@@ -2143,6 +2144,64 @@ async function transformAndMigrateChild(
     const trackingPath = `/tracking/${childId}/${newTracking.id}`;
     multiLocUpdates[trackingPath] = newTracking;
   }
+
+  // events  moment.tz(startDate, timeZone).valueOf(),
+  const eventSnap = await onCureDb
+    .ref("/events")
+    .orderByChild("child_id")
+    .equalTo(childId)
+    .once("value");
+  const allEvents = (eventSnap.val() || {}) as Record<string, any>;
+
+  // 4) Find the single most recent event with state = active or paused
+  let selectedEvent: any = null;
+  let selectedEventKey: string | null = null;
+
+  // 10 days in ms
+  const TEN_DAYS_MS = 10 * 24 * 60 * 60 * 1000;
+  const cutoffTime = Date.now() - TEN_DAYS_MS;
+
+  for (const [key, ev] of Object.entries(allEvents)) {
+    // parse create_date
+    const createMs = parseDate(ev.create_date); // a helper that converts string|number -> ms
+    if (createMs < cutoffTime) {
+      // If event is older than 10 days, ignore it entirely
+      continue;
+    }
+
+    if (ev.state === "active" || ev.state === "paused") {
+      selectedEvent = ev;
+      selectedEventKey = key;
+      break; // done (we only want the first match)
+    }
+  }
+
+  // if we found one
+  if (selectedEvent) {
+    // 5) fetch doses for that event
+    const dosesSnap = await onCureDb
+      .ref("/doses")
+      .orderByChild("event_id")
+      .equalTo(selectedEventKey)
+      .once("value");
+    const doseData = dosesSnap.val() || {};
+
+    // 6) transform the event + doses to your new format
+    const newEventDoc = transformEventAndDoses(
+      selectedEvent,
+      selectedEventKey,
+      doseData,
+      newChild
+    );
+
+    // 7) store it in multiLocUpdates
+    const eventPath = `/events/${newEventDoc.eventId}`;
+    multiLocUpdates[eventPath] = newEventDoc;
+
+    newChild.eventIds = [newEventDoc.eventId];
+  }
+
+  multiLocUpdates[`/children/${childId}`] = newChild;
 
   return multiLocUpdates;
 }
@@ -2417,6 +2476,20 @@ function getIbuprofenValue(index: number): string {
     return ibuprofenDose[index].value;
   }
   return "other"; // fallback
+}
+
+function getAcetaminophenLabel(value) {
+  // Search the array for an item whose 'value' matches
+  const item = acetaminophenDose.find((d) => d.value === value);
+  // Return the label if found, otherwise undefined (or a fallback string)
+  return item ? item.label : "Unknown";
+}
+
+function getIbuprofenLabel(value) {
+  // Search the array for an item whose 'value' matches
+  const item = ibuprofenDose.find((d) => d.value === value);
+  // Return the label if found, otherwise undefined (or a fallback string)
+  return item ? item.label : "Unknown";
 }
 
 /**
@@ -2747,6 +2820,111 @@ function mapEmotional(num: number): string {
   }
 }
 
+//************* Events / Doses ******************/
+
+function transformEventAndDoses(
+  oldEvent: any,
+  selectedEventKey: string,
+  dosesObj: any,
+  newChild: any
+) {
+  // parse event fields
+  const eventId = selectedEventKey || db.ref().push().key;
+  const createDate = parseDate(oldEvent.create_date);
+
+  // maybe get newChild.dosages.acetaminophen.dose
+  // or something to feed into your event doc
+  const dosageType = getDosageByName(newChild.dosages, oldEvent?.cycle);
+
+  // build the doc
+  const newEventDoc: any = {
+    childId: oldEvent.child_id,
+    createDate,
+    cycle: oldEvent.cycle,
+    dosageType: {},
+    dosageGiven: [], // we fill below
+    eventId: eventId,
+    initialDoseStart: parseDate(oldEvent.initial_dose_date),
+    // lastDoseGiven: not defined
+    nextScheduledDose: parseDate(oldEvent.next_scheduled_dose_date),
+    state: oldEvent.state,
+  };
+
+  newEventDoc.dosageType[oldEvent.cycle] = dosageType;
+
+  // transform each dose
+  for (const [doseKey, dose] of Object.entries(dosesObj)) {
+    newEventDoc.dosageGiven.push(
+      transformDose(
+        dose,
+        dosageType,
+        doseKey,
+        parseDate(oldEvent.next_scheduled_dose_date)
+      )
+    );
+
+    // after 1st dose of notGiven, break out of the loop
+    if ((dose as any).state === "notGiven") {
+      break;
+    }
+  }
+
+  return newEventDoc;
+}
+
+function transformDose(
+  doseObj: OldDose,
+  dosageType: any,
+  doseKey: any,
+  nextDoseTime: any
+) {
+  logger.log("doseKey", doseKey, doseObj);
+  const doseInfo: NewDose = {
+    amountGiven:
+      doseObj.medication === "acetaminophen"
+        ? getAcetaminophenLabel(dosageType?.dose)
+        : getIbuprofenLabel(dosageType?.dose),
+    firstDose: doseObj.index === 0,
+    given: doseObj.state === "given",
+    whatGiven: capitalizeFirstLetter(doseObj.medication),
+  };
+
+  if (doseObj.state === "given") {
+    doseInfo.timeGiven = parseDate(doseObj.given_date);
+  } else {
+    doseInfo.timeAvailable = parseDate(nextDoseTime);
+  }
+
+  return doseInfo;
+}
+
+function parseDate(dateVal: any): number {
+  if (!dateVal) return 0;
+
+  if (typeof dateVal === "number") {
+    return dateVal; // Might be ms or a custom epoch
+  }
+
+  if (typeof dateVal === "string") {
+    const momentDate = moment(dateVal); // Parse using Moment.js
+
+    if (momentDate.isValid()) {
+      // Check if parsing was successful
+      return momentDate.valueOf(); // Get milliseconds since epoch
+    } else {
+      console.error(`Invalid date string: ${dateVal}`); // Log the invalid date string
+      return 0; // Or handle the error as needed (e.g., throw an exception)
+    }
+  }
+
+  return 0;
+}
+
+function getDosageByName(dosages: any, name: string) {
+  // Just return dosages[name] if it exists:
+  return dosages[name];
+}
+
 // ****************************************************** End Data Migration ********************************
 
 type Doses = {
@@ -2806,4 +2984,21 @@ type AsNeededDoseType = {
   dateUpdated?: number;
   name?: string;
   description?: string;
+};
+
+type OldDose = {
+  state?: string;
+  given_date?: string;
+  medication?: string;
+  index?: number;
+  // plus any other fields you expect
+};
+
+type NewDose = {
+  amountGiven: string;
+  firstDose: boolean;
+  given: boolean;
+  whatGiven: string;
+  timeGiven?: number; // note the question mark => optional
+  timeAvailable?: number; // optional
 };
