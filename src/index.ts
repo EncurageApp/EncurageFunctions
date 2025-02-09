@@ -2840,7 +2840,7 @@ function transformEventAndDoses(
   const newEventDoc: any = {
     childId: oldEvent.child_id,
     createDate,
-    cycle: oldEvent.cycle,
+    cycle: oldEvent.cycle === "both" ? "alternating" : oldEvent.cycle,
     dosageType: {},
     dosageGiven: [], // we fill below
     eventId: eventId,
@@ -2849,17 +2849,24 @@ function transformEventAndDoses(
     nextScheduledDose: parseDate(oldEvent.next_scheduled_dose_date),
     state: oldEvent.state,
   };
+  if (oldEvent.cycle === "both") {
+    newEventDoc.dosageType = newChild.dosages;
+  } else {
+    newEventDoc.dosageType[oldEvent.cycle] = dosageType;
+  }
 
-  newEventDoc.dosageType[oldEvent.cycle] = dosageType;
+  //Sort the doses by `index`
+  const sortedDoses = sortDosesByIndex(dosesObj);
 
   // transform each dose
-  for (const [doseKey, dose] of Object.entries(dosesObj)) {
+  for (const [doseKey, dose] of sortedDoses) {
     newEventDoc.dosageGiven.push(
       transformDose(
         dose,
-        dosageType,
+        newEventDoc.dosageType,
         doseKey,
-        parseDate(oldEvent.next_scheduled_dose_date)
+        parseDate(oldEvent.next_scheduled_dose_date),
+        oldEvent.cycle
       )
     );
 
@@ -2867,6 +2874,41 @@ function transformEventAndDoses(
     if ((dose as any).state === "notGiven") {
       break;
     }
+  }
+  if (
+    newEventDoc.dosageGiven[newEventDoc.dosageGiven.length - 1].given === true
+  ) {
+    const nextAmount = () => {
+      if (oldEvent.cycle === "both") {
+        return newEventDoc.dosageGiven[newEventDoc.dosageGiven.length - 1]
+          .whatGiven === "acetaminophen"
+          ? getIbuprofenLabel(newEventDoc.dosageType?.ibuprofen?.dose)
+          : getAcetaminophenLabel(newEventDoc.dosageType?.acetaminophen?.dose);
+      } else {
+        return oldEvent.cycle === "acetaminophen"
+          ? getAcetaminophenLabel(dosageType?.dose)
+          : getIbuprofenLabel(dosageType?.dose);
+      }
+    };
+
+    const nextWhat = () => {
+      if (oldEvent.cycle === "both") {
+        return newEventDoc.dosageGiven[newEventDoc.dosageGiven.length - 1]
+          .whatGiven === "acetaminophen"
+          ? "Ibuprofen"
+          : "Acetaminophen";
+      } else {
+        return capitalizeFirstLetter(oldEvent.cycle);
+      }
+    };
+
+    newEventDoc.dosageGiven.push({
+      amountGiven: nextAmount(),
+      firstDose: false,
+      given: false,
+      whatGiven: nextWhat(),
+      timeAvailable: parseDate(oldEvent.next_scheduled_dose_date),
+    });
   }
 
   return newEventDoc;
@@ -2876,21 +2918,37 @@ function transformDose(
   doseObj: OldDose,
   dosageType: any,
   doseKey: any,
-  nextDoseTime: any
+  nextDoseTime: any,
+  cycle: string
 ) {
   logger.log("doseKey", doseKey, doseObj);
-  const doseInfo: NewDose = {
-    amountGiven:
-      doseObj.medication === "acetaminophen"
+
+  const nextAmount = () => {
+    if (cycle === "both") {
+      return doseObj.medication === "acetaminophen"
+        ? getIbuprofenLabel(dosageType?.ibuprofen?.dose)
+        : getAcetaminophenLabel(dosageType?.acetaminophen?.dose);
+    } else {
+      return doseObj.medication === "acetaminophen"
         ? getAcetaminophenLabel(dosageType?.dose)
-        : getIbuprofenLabel(dosageType?.dose),
+        : getIbuprofenLabel(dosageType?.dose);
+    }
+  };
+
+  const doseInfo: NewDose = {
+    index: doseObj.index,
+    amountGiven: nextAmount(),
     firstDose: doseObj.index === 0,
     given: doseObj.state === "given",
-    whatGiven: capitalizeFirstLetter(doseObj.medication),
+    whatGiven: capitalizeFirstLetter(
+      doseObj.medication === "ibprofen" ? "ibuprofen" : doseObj.medication
+    ),
   };
 
   if (doseObj.state === "given") {
-    doseInfo.timeGiven = parseDate(doseObj.given_date);
+    doseInfo.timeGiven = parseDate(
+      doseObj.given_date || doseObj.scheduled_date
+    );
   } else {
     doseInfo.timeAvailable = parseDate(nextDoseTime);
   }
@@ -2923,6 +2981,16 @@ function parseDate(dateVal: any): number {
 function getDosageByName(dosages: any, name: string) {
   // Just return dosages[name] if it exists:
   return dosages[name];
+}
+
+function sortDosesByIndex(dosesObj: Record<string, OldDose>) {
+  // Convert to array of [key, dose] pairs
+  const entries = Object.entries(dosesObj) as [string, any][]; // e.g. [["-O...", { index:2 }], ...]
+  // Sort by dose.index
+  entries.sort(
+    ([keyA, doseA], [keyB, doseB]) => (doseA.index ?? 0) - (doseB.index ?? 0)
+  );
+  return entries;
 }
 
 // ****************************************************** End Data Migration ********************************
@@ -2991,10 +3059,12 @@ type OldDose = {
   given_date?: string;
   medication?: string;
   index?: number;
+  scheduled_date?: string;
   // plus any other fields you expect
 };
 
 type NewDose = {
+  index: number;
   amountGiven: string;
   firstDose: boolean;
   given: boolean;
