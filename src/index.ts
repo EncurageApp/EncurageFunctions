@@ -872,17 +872,6 @@ const removeAllCaregiversForUser = async (userId) => {
   }
 };
 
-enum FrequencyInterval {
-  HOURLY = "hourly", // ok
-  DAILY = "daily", // ok
-  EVERY_OTHER_DAY = "every_other_day",
-  WEEKLY = "weekly", // ok
-  ONCE_A_WEEKLY = "once_a_week",
-  CERTAIN_DAYS = "certain_days", // ok // For specifying particular days of the week
-  MONTHLY = "monthly", // ok
-  CUSTOM = "custom", // For any custom frequency that doesn't fit above types
-}
-
 export function calculateNextDose(prescription: any, timeZone: string): number {
   const { frequency, startDate, reminderTimes } = prescription || {};
   const currentTime = moment.tz(timeZone).valueOf();
@@ -1929,7 +1918,7 @@ async function validateGoogleReceipt(purchaseToken, packageName, productId) {
 // ****************************************************** Start Data Migration ********************************
 
 exports.convertOnCureUser = v1.https.onCall(async (data, context) => {
-  const { appVersion } = data;
+  const { appVersion, timeZone } = data;
   if (!context.auth) {
     throw new v1.https.HttpsError(
       "unauthenticated",
@@ -1988,6 +1977,13 @@ exports.convertOnCureUser = v1.https.onCall(async (data, context) => {
       // B) Migrate old journals for this child
       const journalUpdates = await migrateJournalsForChild(childId);
       Object.assign(updates, journalUpdates);
+
+      // C) Migrate prescriptions for this child
+      const prescriptionUpdates = await migratePrescriptionsForChild(
+        childId,
+        timeZone
+      );
+      Object.assign(updates, prescriptionUpdates);
     }
 
     // 6) Write all at once
@@ -2206,6 +2202,7 @@ async function transformAndMigrateChild(
   return multiLocUpdates;
 }
 
+//************* Child data ******************/
 /**
  * Transforms a single old child record into the new ChildDataType + preserves extra fields.
  * @param oldChildData - The original child object from onCureDb
@@ -2993,6 +2990,284 @@ function sortDosesByIndex(dosesObj: Record<string, OldDose>) {
   return entries;
 }
 
+//************* Prescription / Doses ******************/
+
+// 1) The function that migrates all prescriptions for a given child
+async function migratePrescriptionsForChild(childId: string, timeZone: string) {
+  // Step A: read old "prescription" data from the old DB
+  const prescriptionSnap = await onCureDb
+    .ref("/prescription")
+    .orderByChild("child_id")
+    .equalTo(childId)
+    .once("value");
+
+  const oldPrescriptions = prescriptionSnap.val() || {};
+
+  // Step B: build updates
+  const multiLocUpdates: Record<string, any> = {};
+
+  // Convert each object in oldPrescriptions => array
+  const oldPresArray = Object.entries(oldPrescriptions).map(([key, val]) => ({
+    prescriptionId: key,
+    ...(val as OldPrescription),
+  }));
+
+  // Filter out isDeleted
+  const activePrescriptions = oldPresArray.filter((p) => p.isDeleted !== true);
+
+  // Step C: Transform each old prescription => new model
+  for (const oldPres of activePrescriptions) {
+    const newPres = transformOldPrescriptionToNew(oldPres, timeZone);
+    // decide an ID in the new DB
+    const newId = oldPres.prescriptionId || db.ref().push().key; // reuse old ID or push key
+
+    // we store at /prescription/{newId}
+    multiLocUpdates[`/prescription/${newId}`] = newPres;
+
+    // 4) Create the event object
+    let newEvent = createPrescriptionEvent(newPres, oldPres, timeZone);
+
+    // We'll give it an ID (eventId)
+    const newEventId = db.ref().push().key;
+    newEvent.eventId = newEventId!;
+
+    // Insert under /prescription_events/{newEventId}
+    multiLocUpdates[`/prescription_events/${newEventId}`] = newEvent;
+
+    // C) Fetch + transform doses
+    const dosesSnap = await onCureDb
+      .ref("/prescription_doses")
+      .orderByChild("prescription_id")
+      .equalTo(oldPres.prescriptionId) // match old ID
+      .once("value");
+
+    const oldDoses = dosesSnap.val() || {};
+
+    // Convert => array
+    const oldDosesArray = Object.entries(oldDoses).map(([doseId, doseVal]) => ({
+      doseId,
+      ...(doseVal as OldPrescriptionDose),
+    }));
+
+    // Filter out any state = "notGiven"
+    const givenDoses = oldDosesArray.filter((d) => d.state !== "notGiven");
+
+    // Transform each dose => new model
+    const newDoses = givenDoses.map((oldDose) =>
+      transformOldPrescriptionDoseToNew(oldDose, newPres, newEventId)
+    );
+
+    for (const nd of newDoses) {
+      const doseId = nd.id || db.ref().push().key;
+      // e.g. "/prescription/{presId}/doses/{doseId}"
+      multiLocUpdates[`/prescription_doses/${doseId}`] = nd;
+    }
+  }
+
+  // Step D: write all at once (if desired)
+  // await db.ref().update(multiLocUpdates);
+  return multiLocUpdates;
+}
+
+function transformOldPrescriptionToNew(
+  oldPres: OldPrescription,
+  userTimeZone: string
+): Prescription {
+  const now = Date.now();
+
+  // 1) Clone oldPres so we can remove mapped fields
+  const leftover = { ...oldPres };
+
+  // 2) Parse startDate => epoch
+  const startDateMs = parseDate(oldPres.startDate);
+
+  // 3) If `ongoing` = false, parse endDate => epoch
+  let endDateMs: number | null = null;
+  if (!oldPres.ongoing && oldPres.endDate) {
+    endDateMs = parseDate(oldPres.endDate);
+  }
+
+  // 4) Build `PrescriptionDoseType`
+  const dose: PrescriptionDoseType = {
+    dose: oldPres.doseAmount != null ? String(oldPres.doseAmount) : "",
+    unit: "other",
+    unitOther: oldPres.doseUnit || "",
+  };
+
+  // 5) Build frequency
+  const frequency: FrequencyType = parseOldFrequency(oldPres);
+  frequency.startDate = startDateMs;
+
+  // 6) Construct new prescription
+  const newPrescription: Prescription = {
+    id: oldPres.prescriptionId,
+    childId: oldPres.child_id,
+    parentId: oldPres.parent_id,
+    name: oldPres.name || "Untitled",
+    dose,
+    frequency,
+    duration: !oldPres.ongoing
+      ? { interval: formatTwoDigits(oldPres.duration), period: "Days" }
+      : null,
+    startDate: startDateMs,
+    endDate: endDateMs,
+    reminderTimes: (oldPres.dailyReminderTimes || []).map((oldVal) =>
+      convertUtcSecondsToLocalSeconds(oldVal, userTimeZone)
+    ),
+    dateAdded: now,
+    totalDoses: !oldPres.ongoing ? frequency.interval * oldPres.duration : null,
+  };
+
+  // 7) Remove mapped fields from leftover
+  //    (any field used in constructing newPrescription)
+  delete leftover.prescriptionId;
+  delete leftover.child_id;
+  delete leftover.parent_id;
+  delete leftover.name;
+  delete leftover.doseAmount;
+  delete leftover.doseUnit;
+  delete leftover.endDate;
+  delete leftover.duration;
+  delete leftover.dailyReminderTimes;
+  delete leftover.ongoing;
+  delete leftover.startDate;
+  // etc. for every field you explicitly used above
+
+  // 8) Attach leftover under a property, e.g. `legacyFields`
+  //    so you can still keep them if needed
+  //    (You may not want to store them directly in newPrescription root)
+  (newPrescription as any).legacyFields = leftover;
+
+  return newPrescription;
+}
+
+function parseOldFrequency(oldPres: OldPrescription): FrequencyType {
+  // Example: if oldPres.doseFrequency === "2:d", that might be "2 times daily"
+  const freqDecoded = decodeDoseFrequency(oldPres.doseFrequency);
+
+  let frequency: FrequencyType = {
+    type: FrequencyInterval.DAILY, // an enum in your new code
+    interval: freqDecoded.count,
+  };
+
+  if (freqDecoded.type === DecodedFrequencyType.WEEKLY) {
+    frequency = {
+      type: FrequencyInterval.WEEKLY,
+      interval: freqDecoded.count,
+    };
+  } else if (freqDecoded.type === DecodedFrequencyType.MONTHLY) {
+    frequency = {
+      type: FrequencyInterval.MONTHLY,
+      interval: freqDecoded.count,
+    };
+  } else if (freqDecoded.type === DecodedFrequencyType.CUSTOM) {
+    frequency = {
+      type: FrequencyInterval.CUSTOM,
+      interval: freqDecoded.count,
+    };
+  }
+
+  return frequency;
+}
+
+function transformOldPrescriptionDoseToNew(
+  oldDose: OldPrescriptionDose,
+  newPres: Prescription,
+  newEventId: string
+): Doses {
+  // parse date from e.g. oldDose.given_date or scheduled_date
+  const dateMs =
+    parseDate(oldDose.given_date) || parseDate(oldDose.scheduled_date);
+
+  const newDose: Doses = {
+    date: parseDate(oldDose.scheduled_date), // not sure
+    dose: newPres.dose,
+    given: oldDose.state === "given",
+    id: oldDose.doseId,
+    name: newPres.name, // or set from oldDose.medication if needed
+    prescriptionEventId: newEventId, // or if you're using some event id; for now we link to newPresId
+    timeGiven: dateMs,
+    frequencyType: newPres.frequency.type, // if you want to set from something
+  };
+
+  return newDose;
+}
+
+/**
+ * Decodes strings like "2:d", "3:w", "1:m" into a structured object
+ * { type: 'daily' | 'weekly' | 'monthly', count: number }.
+ * If the format is unrecognized, returns { type: 'custom', count: 1 } by default.
+ */
+function decodeDoseFrequency(freq: string | undefined): DecodedDoseFrequency {
+  if (!freq) {
+    return { type: DecodedFrequencyType.CUSTOM, count: 1 };
+  }
+
+  // e.g. "2:d" -> ["2", "d"]
+  const [countStr, letter] = freq.split(":");
+  const count = parseInt(countStr, 10) || 1;
+
+  switch (letter) {
+    case "d":
+      // 2:d => daily(2)
+      return { type: DecodedFrequencyType.DAILY, count };
+    case "w":
+      // 3:w => weekly(3)
+      return { type: DecodedFrequencyType.WEEKLY, count };
+    case "m":
+      // 1:m => monthly(1)
+      return { type: DecodedFrequencyType.MONTHLY, count };
+    default:
+      // If it's something else, fallback:
+      return { type: DecodedFrequencyType.CUSTOM, count };
+  }
+}
+
+function formatTwoDigits(num: number): string {
+  return num < 10 ? `0${num}` : `${num}`;
+}
+
+function createPrescriptionEvent(
+  newPres: Prescription, // your new mapped prescription
+  oldPres: OldPrescription, // the original old data if needed
+  timeZone: string
+): Prescription_events {
+  const nextDose = calculateNextDose(newPres, timeZone);
+  const event: Prescription_events = {
+    childId: newPres.childId,
+    createDate: Date.now(), // You can also parse from oldPres if you want
+    eventId: "",
+    nextScheduledDose: nextDose,
+    prescriptionId: newPres.id,
+    startDate: newPres.startDate,
+    state: "active",
+  };
+
+  return event;
+}
+
+// If oldVal is in UTC seconds from midnight:
+function convertUtcSecondsToLocalSeconds(
+  oldVal: number,
+  timeZone: string
+): number {
+  // 1) Build a moment in UTC for the day
+  //    i.e. 1970-01-01T00:00:00Z plus oldVal seconds
+  const utcMoment = moment.utc("1970-01-01 00:00:00").add(oldVal, "seconds");
+
+  // 2) Convert that moment to the user’s local time zone
+  const localMoment = utcMoment.tz(timeZone);
+
+  // 3) Compute localSeconds from midnight local
+  //    For that same date. E.g. localMoment.hour()*3600 + localMoment.minute()*60 ...
+  const localSeconds =
+    localMoment.hours() * 3600 +
+    localMoment.minutes() * 60 +
+    localMoment.seconds();
+
+  return localSeconds * 1000;
+}
+
 // ****************************************************** End Data Migration ********************************
 
 type Doses = {
@@ -3007,6 +3282,7 @@ type Doses = {
   adminSite?: string | null;
   adminSiteDetails?: string | null;
   dose?: any;
+  frequencyType?: string;
 };
 
 type GivenBy = {
@@ -3072,3 +3348,142 @@ type NewDose = {
   timeGiven?: number; // note the question mark => optional
   timeAvailable?: number; // optional
 };
+
+/**
+ * Represents the old Swift-based prescription model from the DB.
+ */
+type OldPrescription = {
+  uid?: string; // sometimes the Swift code sets uid = <Firebase key>
+  apiVersion?: string; // e.g. "1.1"
+  name?: string; // e.g. "Ad"
+  doseAmount?: number; // e.g. 5
+  doseUnit?: string; // e.g. "milliliters(solution)" or "patches"
+  dailyFrequency?: number; // e.g. 2
+  doseFrequency?: string; // e.g. "2:d", "1:d"
+  duration?: number; // e.g. 370
+  startDate?: string; // "2025-02-05T05:00:00.000+0000"
+  endDate?: string; // "2026-02-10T05:00:00.000+0000"
+  initialDoseDate?: string; // "2025-02-05T22:11:00.000+0000"
+  dailyReminderTimes?: number[]; // e.g. [39600, 82800]
+  parent_id?: string; // e.g. "zvi7h7AsSqSfacqp7tB89IwHny72"
+  child_id: string; // e.g. "-LP1vPvLpbi1nkqeudV_"
+  childsName?: string; // "Emily Golan"
+  isDeleted?: boolean; // e.g. false
+  ongoing?: boolean; // e.g. true
+  givenDosesNeedUpdate?: boolean;
+  docReminderFrequency?: string; // e.g. "1:m", "2:w"
+  docAppointmentTime?: number; // e.g. -1740546000
+  prescriptionId?: string;
+};
+
+type Prescription = {
+  id?: string;
+  childId: string;
+  parentId: string;
+  name: string;
+  dose: PrescriptionDoseType;
+  frequency: FrequencyType; // FrequencyType to handle various scheduling needs
+  duration?: DurationType | null; // Optional duration in days or total doses
+  startDate: number; // Timestamp for the start date
+  endDate?: number | null; // Optional end date, calculated from startDate and duration
+  reminderTimes?: number[]; // Array of reminders per day, if applicable
+  dateAdded?: number; // Timestamp for when the prescription was added
+  dateUpdated?: number; // Optional timestamp for the last update
+  notes?: string | null; // Additional notes about the prescription
+  shapeAndColor?: string | null; // Additional notes about the prescription
+  conditionReason?: string | null; // Additional notes about the prescription
+  totalDoses?: number | null;
+};
+
+type Prescription_events = {
+  childId: string;
+  prescriptionId: string;
+  createDate?: number;
+  cycle?: string;
+  startDate?: number;
+  lastDoseGiven?: number;
+  nextScheduledDose?: number;
+  nextNotificationTime?: number; // added after 1st notification
+  notificationCount?: number; // to indicate notification count
+  snoozeInterval?: number; // TODO add to event when snoozed notification?
+  state?: string;
+  eventId?: string;
+};
+
+/**
+ * Represents an old dose object from 'prescription_doses'.
+ */
+type OldPrescriptionDose = {
+  apiVersion?: string; // e.g. "1.1"
+  caregiver_id?: string; // e.g. "zvi7h7AsSqSfacqp7tB89IwHny72"
+  given_date?: string; // "2025-02-06T04:14:30.801+0000"
+  prescription_id?: string; // matches the old prescription key
+  scheduled_date?: string; // "2025-02-06T04:14:26.716+0000"
+  state?: string; // e.g. "given", "notGiven"
+  doseAmount?: number; // If it existed, bridging from Swift's 'doseAmount'
+  doseUnit?: string; // bridging from 'doseUnit'
+  // ...any other fields you see in the Swift side
+  index?: number; // if the Swift code stored a dose index
+  doseId?: string;
+};
+
+type PrescriptionDoseType = {
+  dose: string;
+  doseOther?: string;
+  unit?: string;
+  unitOther?: string;
+  form?: string;
+  formOther?: string;
+  name?: string;
+  description?: string;
+  dateAdded?: number;
+  dateUpdated?: number;
+};
+
+type DurationType = {
+  interval: string;
+  period: string;
+};
+
+type FrequencyType = {
+  type: FrequencyInterval; // Enum to specify the type of frequency (see below)
+  interval?: number; // Number of hours, days, or weeks, depending on the type
+  daysOfWeek?: DaysOfWeek[]; // Array of days for weekly or specific day frequencies
+  timeOfDay?: number; // Array of time for time frequencies
+  startDate?: number;
+  monthsInterval?: number; // For frequencies specified in months
+};
+
+enum FrequencyInterval {
+  HOURLY = "hourly", // ok
+  DAILY = "daily", // ok
+  EVERY_OTHER_DAY = "every_other_day",
+  WEEKLY = "weekly", // ok
+  ONCE_A_WEEKLY = "once_a_week",
+  CERTAIN_DAYS = "certain_days", // ok // For specifying particular days of the week
+  MONTHLY = "monthly", // ok
+  CUSTOM = "custom", // For any custom frequency that doesn't fit above types
+}
+
+enum DecodedFrequencyType {
+  DAILY = "daily",
+  WEEKLY = "weekly",
+  MONTHLY = "monthly",
+  CUSTOM = "custom",
+}
+
+type DecodedDoseFrequency = {
+  type: DecodedFrequencyType;
+  count: number; // e.g. 2 if "2:d"
+};
+
+// Days of the week for SPECIFIC_DAYS frequency type
+export enum DaysOfWeek {
+  SUNDAY = "Sunday",
+  MONDAY = "Monday",
+  TUESDAY = "Tuesday",
+  WEDNESDAY = "Wednesday",
+  THURSDAY = "Thursday",
+  FRIDAY = "Friday",
+  SATURDAY = "Saturday",
+}
