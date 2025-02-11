@@ -9,12 +9,9 @@ import { google } from "googleapis";
 const serviceAccount = require("../oncure-app-firebase-adminsdk-j41yq-34921b17e4.json");
 
 // 1) Default app
-admin.initializeApp(
-  {
-    databaseURL: "https://encurage-new-default-rtdb.firebaseio.com",
-  },
-  "defaultApp"
-);
+admin.initializeApp({
+  databaseURL: "https://encurage-new-default-rtdb.firebaseio.com",
+});
 
 // 2) Secondary app
 admin.initializeApp(
@@ -26,7 +23,7 @@ admin.initializeApp(
 );
 
 // Get the database reference for each
-const db = admin.app("defaultApp").database();
+const db = admin.app().database();
 const onCureDb = admin.app("onCureApp").database();
 
 // Start writing functions
@@ -690,8 +687,7 @@ function getChild(childId) {
           `Cannot locate child. An invalid childId was given - childId was undefined.`
         )
       )
-    : admin
-        .database()
+    : db
         .ref(`/children/${childId}`)
         .once("value")
         .then((userSnapshot) => {
@@ -708,8 +704,7 @@ function getUser(userId) {
           `Cannot locate user. An invalid userId was given - userId was undefined.`
         )
       )
-    : admin
-        .database()
+    : db
         .ref(`/users/${userId}`)
         .once("value")
         .then((userSnapshot) => {
@@ -724,7 +719,7 @@ function sendPushNotificationsToUser(
   payload: string,
   data?: any
 ) {
-  const pushTokensRef = admin.database().ref(`/users/${userId}/pushToken`);
+  const pushTokensRef = db.ref(`/users/${userId}/pushToken`);
   return pushTokensRef
     .once("value")
     .then((snapshot): any => {
@@ -875,7 +870,7 @@ const removeAllCaregiversForUser = async (userId) => {
 export function calculateNextDose(prescription: any, timeZone: string): number {
   const { frequency, startDate, reminderTimes } = prescription || {};
   const currentTime = moment.tz(timeZone).valueOf();
-  logger.log("currentTime", currentTime);
+  logger.log("currentTime", currentTime, prescription);
 
   // Ensure nextDose is at least `startDate` and after the current time
   let nextDose = Math.max(
@@ -1247,10 +1242,7 @@ export const generateCaregiverInviteCode = v1.https.onCall(
 
     // Save invite to Realtime Database under `caregiver_invite`
     try {
-      const inviteRef = await admin
-        .database()
-        .ref("caregiver_invite")
-        .push(inviteData);
+      const inviteRef = await db.ref("caregiver_invite").push(inviteData);
       return { success: true, inviteId: inviteRef.key, code };
     } catch (error) {
       logger.error("Error creating caregiver invite:", error);
@@ -1598,17 +1590,14 @@ exports.validatePurchase = v1.https.onCall(async (data, context) => {
         : null;
 
       // Update subscription status in the database
-      await admin
-        .database()
-        .ref(`/users/${userId}`)
-        .update({
-          purchaseInfo: {
-            subscriptionExpiry: subscriptionExpiry?.toISOString() || null,
-            productId,
-            transactionReceipt: receipt, // For Apple
-          },
-          subscribed: !!activeSubscription, // true if an active subscription exists
-        });
+      await db.ref(`/users/${userId}`).update({
+        purchaseInfo: {
+          subscriptionExpiry: subscriptionExpiry?.toISOString() || null,
+          productId,
+          transactionReceipt: receipt, // For Apple
+        },
+        subscribed: !!activeSubscription, // true if an active subscription exists
+      });
 
       logger.log("validationResponse", validationResponse);
       logger.log("validationResponse.status", validationResponse.status);
@@ -1640,17 +1629,14 @@ exports.validatePurchase = v1.https.onCall(async (data, context) => {
         parseInt(validationResponse.expiryTimeMillis, 10)
       );
 
-      await admin
-        .database()
-        .ref(`/users/${userId}`)
-        .update({
-          purchaseInfo: {
-            subscriptionExpiry: subscriptionExpiry.toISOString(),
-            productId,
-            purchaseToken: purchaseToken, // For Google
-          },
-          subscribed: subscriptionExpiry.getTime() > now,
-        });
+      await db.ref(`/users/${userId}`).update({
+        purchaseInfo: {
+          subscriptionExpiry: subscriptionExpiry.toISOString(),
+          productId,
+          purchaseToken: purchaseToken, // For Google
+        },
+        subscribed: subscriptionExpiry.getTime() > now,
+      });
 
       return {
         purchaseState: validationResponse.paymentState, // Google purchase state
@@ -1688,7 +1674,7 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
   logger.log(`Checking subscription for user: ${userId}`);
 
   try {
-    const userRef = admin.database().ref(`/users/${userId}`);
+    const userRef = db.ref(`/users/${userId}`);
     const userSnapshot = await userRef.once("value");
     const userData = userSnapshot.val();
 
@@ -1927,6 +1913,7 @@ exports.convertOnCureUser = v1.https.onCall(async (data, context) => {
   }
 
   const userId = context.auth.uid;
+  logger.log("userId", userId);
 
   try {
     // 1) Fetch old user
@@ -1986,6 +1973,9 @@ exports.convertOnCureUser = v1.https.onCall(async (data, context) => {
       Object.assign(updates, prescriptionUpdates);
     }
 
+    const caregiverUpdates = await migrateCaregiversForUser(userId);
+    Object.assign(updates, caregiverUpdates);
+
     // 6) Write all at once
     await db.ref().update(updates);
 
@@ -2002,6 +1992,8 @@ exports.convertOnCureUser = v1.https.onCall(async (data, context) => {
     );
   }
 });
+
+//************* User data ******************/
 
 /**
  * Transform the old onCure user data into the new `User` shape.
@@ -2075,6 +2067,66 @@ function transformOnCureUser(
   return newUser;
 }
 
+async function migrateCaregiversForUser(
+  userId: string
+): Promise<Record<string, any>> {
+  // 1) We'll gather all matching caregivers in one array
+  const allCaregiversArray: Array<{ caregiverKey: string; [k: string]: any }> =
+    [];
+
+  // A) Query for caregiver_id == userId
+  const caregiverSnap = await onCureDb
+    .ref("/caregiver")
+    .orderByChild("caregiver_id")
+    .equalTo(userId)
+    .once("value");
+  const caregiverVal = caregiverSnap.val() || {};
+  // Convert to array
+  for (const [key, val] of Object.entries(caregiverVal)) {
+    allCaregiversArray.push({ id: key, ...(val as any) });
+  }
+
+  // B) Query for parent_id == userId
+  const parentSnap = await onCureDb
+    .ref("/caregiver")
+    .orderByChild("parent_id")
+    .equalTo(userId)
+    .once("value");
+  const parentVal = parentSnap.val() || {};
+  for (const [key, val] of Object.entries(parentVal)) {
+    allCaregiversArray.push({ id: key, ...(val as any) });
+  }
+
+  // 2) Build a multi-loc updates object for new DB
+  const multiLocUpdates: Record<string, any> = {};
+
+  // 3) Filter out duplicates if the same record might appear in both queries
+  const uniqueCaregiversMap = new Map<string, any>();
+  for (const caregiver of allCaregiversArray) {
+    uniqueCaregiversMap.set(caregiver.caregiverKey, caregiver);
+  }
+  const uniqueCaregivers = Array.from(uniqueCaregiversMap.values());
+
+  // 4) For each caregiver record, transform as needed
+  for (const oldCaregiver of uniqueCaregivers) {
+    // Example: transform or rename fields if needed, or just store them
+    // We'll pick a new ID or reuse the old key
+    const newCaregiverId = oldCaregiver.caregiverKey;
+
+    // This is a minimal transform; adjust as needed
+    const newCaregiverObj = {
+      // Keep all old fields as is
+      ...oldCaregiver,
+    };
+
+    // store in /caregiver/newCaregiverId
+    multiLocUpdates[`/caregiver/${newCaregiverId}`] = newCaregiverObj;
+  }
+
+  return multiLocUpdates;
+}
+
+//************* Child data ******************/
 async function transformAndMigrateChild(
   oldChildData: any,
   childId: string,
@@ -2202,7 +2254,6 @@ async function transformAndMigrateChild(
   return multiLocUpdates;
 }
 
-//************* Child data ******************/
 /**
  * Transforms a single old child record into the new ChildDataType + preserves extra fields.
  * @param oldChildData - The original child object from onCureDb
@@ -3143,7 +3194,13 @@ function transformOldPrescriptionToNew(
 
 function parseOldFrequency(oldPres: OldPrescription): FrequencyType {
   // Example: if oldPres.doseFrequency === "2:d", that might be "2 times daily"
-  const freqDecoded = decodeDoseFrequency(oldPres.doseFrequency);
+  const freqString =
+    oldPres.doseFrequency ??
+    (oldPres.dailyFrequency != null
+      ? String(oldPres.dailyFrequency)
+      : undefined);
+
+  const freqDecoded = decodeDoseFrequency(freqString);
 
   let frequency: FrequencyType = {
     type: FrequencyInterval.DAILY, // an enum in your new code
@@ -3162,7 +3219,7 @@ function parseOldFrequency(oldPres: OldPrescription): FrequencyType {
     };
   } else if (freqDecoded.type === DecodedFrequencyType.CUSTOM) {
     frequency = {
-      type: FrequencyInterval.CUSTOM,
+      type: FrequencyInterval.DAILY,
       interval: freqDecoded.count,
     };
   }
@@ -3202,6 +3259,9 @@ function decodeDoseFrequency(freq: string | undefined): DecodedDoseFrequency {
   if (!freq) {
     return { type: DecodedFrequencyType.CUSTOM, count: 1 };
   }
+  if (freq.length === 1) {
+    return { type: DecodedFrequencyType.DAILY, count: parseInt(freq, 10) };
+  }
 
   // e.g. "2:d" -> ["2", "d"]
   const [countStr, letter] = freq.split(":");
@@ -3217,6 +3277,9 @@ function decodeDoseFrequency(freq: string | undefined): DecodedDoseFrequency {
     case "m":
       // 1:m => monthly(1)
       return { type: DecodedFrequencyType.MONTHLY, count };
+    case "y":
+      // 1:y => year(1)
+      return { type: DecodedFrequencyType.MONTHLY, count: count * 12 };
     default:
       // If it's something else, fallback:
       return { type: DecodedFrequencyType.CUSTOM, count };
@@ -3232,6 +3295,7 @@ function createPrescriptionEvent(
   oldPres: OldPrescription, // the original old data if needed
   timeZone: string
 ): Prescription_events {
+  logger.log();
   const nextDose = calculateNextDose(newPres, timeZone);
   const event: Prescription_events = {
     childId: newPres.childId,
@@ -3469,6 +3533,7 @@ enum DecodedFrequencyType {
   DAILY = "daily",
   WEEKLY = "weekly",
   MONTHLY = "monthly",
+  YEARLY = "yearly",
   CUSTOM = "custom",
 }
 
