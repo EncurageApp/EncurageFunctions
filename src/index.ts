@@ -1677,6 +1677,12 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
     const userRef = db.ref(`/users/${userId}`);
     const userSnapshot = await userRef.once("value");
     const userData = userSnapshot.val();
+    if (userData?.legacySubscription === true) {
+      return {
+        subscribed: "legacySubscription",
+        subscriptionExpiry: userData?.subscriptionExpiry,
+      };
+    }
 
     if (
       !userData ||
@@ -2888,7 +2894,12 @@ function transformEventAndDoses(
   const newEventDoc: any = {
     childId: oldEvent.child_id,
     createDate,
-    cycle: oldEvent.cycle === "both" ? "alternating" : oldEvent.cycle,
+    cycle:
+      oldEvent.cycle === "both"
+        ? "alternating"
+        : oldEvent.cycle === "ibprofen"
+        ? "ibuprofen"
+        : oldEvent.cycle,
     dosageType: {},
     dosageGiven: [], // we fill below
     eventId: eventId,
@@ -2970,6 +2981,7 @@ function transformDose(
   cycle: string
 ) {
   logger.log("doseKey", doseKey, doseObj);
+  logger.log("dosageType", dosageType);
 
   const nextAmount = () => {
     if (cycle === "both") {
@@ -3079,7 +3091,7 @@ async function migratePrescriptionsForChild(childId: string, timeZone: string) {
     let newEvent = createPrescriptionEvent(newPres, oldPres, timeZone);
 
     // We'll give it an ID (eventId)
-    const newEventId = db.ref().push().key;
+    const newEventId = `pe-${newId}`;
     newEvent.eventId = newEventId!;
 
     // Insert under /prescription_events/{newEventId}
