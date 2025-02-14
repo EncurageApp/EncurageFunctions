@@ -714,65 +714,62 @@ function getUser(userId) {
         });
 }
 
-function sendPushNotificationsToUser(
+async function sendPushNotificationsToUser(
   userId: string,
   payload: string,
   data?: any
 ) {
-  const pushTokensRef = db.ref(`/users/${userId}/pushToken`);
-  return pushTokensRef
-    .once("value")
-    .then((snapshot): any => {
-      if (!snapshot.exists()) {
-        logger.log(
-          `No push token found for user ${userId}. Cannot send notification.`
-        );
-        return { successCount: 0, failureCount: 0, results: [] };
-      }
+  let recipientPushToken = "";
+  try {
+    const pushTokensRef = db.ref(`/users/${userId}/pushToken`);
+    const snapshot = await pushTokensRef.once("value");
+    if (!snapshot.exists()) {
+      logger.log(
+        `No push token found for user ${userId}. Cannot send notification.`
+      );
+      return { successCount: 0, failureCount: 0, results: [] };
+    }
 
-      const recipientPushToken = snapshot.val();
-      const threadId = data?.eventId;
+    recipientPushToken = snapshot.val();
+    const threadId = data?.eventId;
 
-      const androidConfig: admin.messaging.AndroidConfig = {
-        priority: "high",
-        collapseKey: threadId || "default", // Use a unique key for Android notifications
-      };
+    const androidConfig: admin.messaging.AndroidConfig = {
+      priority: "high",
+      collapseKey: threadId || "default",
+    };
 
-      const iosConfig: admin.messaging.ApnsConfig = {
-        headers: {
-          "apns-priority": "10", // Set the priority for iOS (10 is the highest)
+    const iosConfig: admin.messaging.ApnsConfig = {
+      headers: { "apns-priority": "10" },
+      payload: {
+        aps: {
+          sound: "default",
+          "content-available": 1,
+          "thread-id": threadId || "default",
         },
-        payload: {
-          aps: {
-            sound: "default",
-            // badge: 0,
-            "content-available": 1,
-            "thread-id": threadId || "default", // Unique thread ID for grouping
-          },
-        },
-      };
+      },
+    };
 
-      const message: admin.messaging.Message = {
-        token: recipientPushToken,
-        notification: {
-          title: "Encurage",
-          body: payload,
-        },
-        data: {
-          ...data,
-        },
-        android: androidConfig,
-        apns: iosConfig,
-      };
-      return admin.messaging().send(message);
-    })
-    .then((response: any) => {
-      logger.log(`Successfully sent message:`, response);
-      return Promise.resolve(response);
-    })
-    .catch((error) => {
-      logger.error("sendPushNotificationsToUser error", error);
-    });
+    const message: admin.messaging.Message = {
+      token: recipientPushToken,
+      notification: {
+        title: "Encurage",
+        body: payload,
+      },
+      data: { ...data },
+      android: androidConfig,
+      apns: iosConfig,
+    };
+
+    const response = await admin.messaging().send(message);
+    logger.log(`Successfully sent message:`, response);
+    return response;
+  } catch (error) {
+    logger.error(
+      `Error sending push notification for user ${userId} with token ${recipientPushToken}:`,
+      error
+    );
+    throw error;
+  }
 }
 
 const getPrescription = async (prescriptionId: string) => {
@@ -2041,13 +2038,12 @@ function transformOnCureUser(
     delete newUser.apiVersion;
   }
 
-  // 4) Convert `dob` to epoch time if it’s a string (e.g., '1975-05-20T05:00:00.000+0000')
+  // 4) Convert `dob` to epoch time if it’s a string
   if (typeof newUser.dob === "string") {
     const dateObj = new Date(newUser.dob);
     if (!isNaN(dateObj.valueOf())) {
       newUser.dob = dateObj.getTime(); // milliseconds since epoch
     } else {
-      // If parsing fails, you could default to 0 or remove the field:
       newUser.dob = 0;
     }
   }
@@ -2055,21 +2051,29 @@ function transformOnCureUser(
   // 5) Check for any legacy flags
   const legacyFlags = [
     "onCure360Enabled",
-    "ongoingRxEnabled", // double check in xcode
+    "ongoingRxEnabled",
     "proMembershipEnabled",
     "symptomTrackerEnabled",
     "unlimitedEpisodesEnabled",
   ];
   for (const flag of legacyFlags) {
     if (newUser[flag]) {
-      // If any of these are truthy, set legacySubscription = true
       newUser.legacySubscription = true;
       break;
     }
   }
 
-  // 6) Return the final object. You could cast to `User` if you like,
-  //    but remember we are keeping extra old fields.
+  // *** New Step: Remove push token ***
+  // If a push token exists from the old app (which was from another project),
+  // remove it so the client is forced to get a new token from the correct project.
+  if (newUser.pushToken) {
+    delete newUser.pushToken;
+  }
+
+  // *** New Step: Toggle allowsPushNotifications to false ***
+  newUser.allowsPushNotifications = false;
+
+  // 6) Return the final object.
   return newUser;
 }
 
@@ -2291,65 +2295,76 @@ function transformOnCureChild(
     delete newChild.weight;
   }
 
-  // 6. Build the `dosages` object from the old user_defined_* fields
-  //    We'll store today's date in epoch time
+  // 6. Build the `dosages` object conditionally
   const now = Date.now();
 
-  // Get numeric indexes (should always exist, per your spec)
-  const acetIndex = Number(newChild.user_defined_acetaminophen_dose);
-  const ibuIndex = Number(newChild.user_defined_ibuprofen_dose);
+  // Check if the old fields exist (and are not undefined or null)
+  const hasAcet = newChild?.user_defined_acetaminophen_dose != null;
+  const hasIbu = newChild?.user_defined_ibuprofen_dose != null;
 
-  // Map them to the new dose values
-  const acetaminophenDoseValue = getAcetaminophenValue(acetIndex);
-  const ibuprofenDoseValue = getIbuprofenValue(ibuIndex);
+  if (hasAcet || hasIbu) {
+    // Create a dosages object
+    newChild.dosages = {};
 
-  // Create the `dosages` object
-  newChild.dosages = {
-    acetaminophen: {
-      dateAdded: now,
-      dose: acetaminophenDoseValue,
-      maxDose: "5",
-      name: "Acetaminophen",
-      timeGap: "4",
-    },
-    ibuprofen: {
-      dateAdded: now,
-      dose: ibuprofenDoseValue,
-      maxDose: "4",
-      name: "Ibuprofen",
-      timeGap: "6",
-    },
-    alternating: {
-      dateAdded: now,
-      name: "Alternating",
-      timeGap: "3",
-    },
-  };
+    if (hasAcet) {
+      // Convert the value; if missing, default to 0.
+      const acetIndex = Number(newChild.user_defined_acetaminophen_dose);
+      const finalAcetIndex = isNaN(acetIndex) ? 0 : acetIndex;
+      const acetaminophenDoseValue = getAcetaminophenValue(finalAcetIndex);
+      newChild.dosages.acetaminophen = {
+        dateAdded: now,
+        dose: acetaminophenDoseValue,
+        maxDose: "5",
+        name: "Acetaminophen",
+        timeGap: "4",
+      };
+      if (acetaminophenDoseValue === "other") {
+        const oldAcetText = newChild.user_defined_acetaminophen_dose_text;
+        if (typeof oldAcetText === "string" && oldAcetText.trim() !== "") {
+          newChild.dosages.acetaminophen.doseOther = oldAcetText;
+        }
+      }
+    }
 
-  // 7. If the mapped dose is "other", check if the old dose_text field is present
-  if (acetaminophenDoseValue === "other") {
-    const oldAcetText = newChild.user_defined_acetaminophen_dose_text;
-    if (typeof oldAcetText === "string" && oldAcetText.trim() !== "") {
-      newChild.dosages.acetaminophen.doseOther = oldAcetText;
+    if (hasIbu) {
+      const ibuIndex = Number(newChild.user_defined_ibuprofen_dose);
+      const finalIbuIndex = isNaN(ibuIndex) ? 0 : ibuIndex;
+      const ibuprofenDoseValue = getIbuprofenValue(finalIbuIndex);
+      newChild.dosages.ibuprofen = {
+        dateAdded: now,
+        dose: ibuprofenDoseValue,
+        maxDose: "4",
+        name: "Ibuprofen",
+        timeGap: "6",
+      };
+      if (ibuprofenDoseValue === "other") {
+        const oldIbuText = newChild.user_defined_ibuprofen_dose_text;
+        if (typeof oldIbuText === "string" && oldIbuText.trim() !== "") {
+          newChild.dosages.ibuprofen.doseOther = oldIbuText;
+        }
+      }
+    }
+
+    // Only add the alternating dosage if both acetaminophen and ibuprofen exist.
+    if (hasAcet && hasIbu) {
+      newChild.dosages.alternating = {
+        dateAdded: now,
+        name: "Alternating",
+        timeGap: "3",
+      };
     }
   }
-  if (ibuprofenDoseValue === "other") {
-    const oldIbuText = newChild.user_defined_ibuprofen_dose_text;
-    if (typeof oldIbuText === "string" && oldIbuText.trim() !== "") {
-      newChild.dosages.ibuprofen.doseOther = oldIbuText;
-    }
-  }
 
-  // Optionally, remove the old fields if you don't need them anymore
+  // Optionally, remove the old dosage fields if you don't need them anymore
   delete newChild.user_defined_acetaminophen_dose;
-  delete newChild.user_defined_acetaminophen_dose_text; // sometimes present
+  delete newChild.user_defined_acetaminophen_dose_text;
   delete newChild.user_defined_ibuprofen_dose;
-  delete newChild.user_defined_ibuprofen_dose_text; // sometimes present
+  delete newChild.user_defined_ibuprofen_dose_text;
 
-  // 8. Retain the child’s ID
+  // 8. Retain the child's ID
   newChild.childId = childId;
 
-  // add app version
+  // 9. Add app version
   if (typeof newChild.apiVersion === "string") {
     newChild.appVersion = appVersion;
     delete newChild.apiVersion;
@@ -2880,7 +2895,12 @@ function transformEventAndDoses(
 
   // maybe get newChild.dosages.acetaminophen.dose
   // or something to feed into your event doc
-  const dosageType = getDosageByName(newChild.dosages, oldEvent?.cycle);
+  // const dosageType = getDosageByName(
+  //   newChild?.dosages,
+  //   oldEvent.cycle === "ibprofen" ? "ibuprofen" : oldEvent.cycle
+  // );
+
+  let dosageType: any;
 
   // build the doc
   const newEventDoc: any = {
@@ -2903,7 +2923,13 @@ function transformEventAndDoses(
   if (oldEvent.cycle === "both") {
     newEventDoc.dosageType = newChild.dosages;
   } else {
-    newEventDoc.dosageType[oldEvent.cycle] = dosageType;
+    dosageType = getDosageByName(
+      newChild?.dosages,
+      oldEvent.cycle === "ibprofen" ? "ibuprofen" : oldEvent.cycle
+    );
+    newEventDoc.dosageType[
+      oldEvent.cycle === "ibprofen" ? "ibuprofen" : oldEvent.cycle
+    ] = dosageType;
   }
 
   //Sort the doses by `index`
