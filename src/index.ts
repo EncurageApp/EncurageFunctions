@@ -2073,12 +2073,11 @@ function transformOnCureUser(
   return newUser;
 }
 
-async function migrateCaregiversForUser(
+export async function migrateCaregiversForUser(
   userId: string
 ): Promise<Record<string, any>> {
-  // 1) We'll gather all matching caregivers in one array
-  const allCaregiversArray: Array<{ caregiverKey: string; [k: string]: any }> =
-    [];
+  // 1) Gather all matching caregivers in one array
+  const allCaregiversArray: Array<{ id: string; [k: string]: any }> = [];
 
   // A) Query for caregiver_id == userId
   const caregiverSnap = await onCureDb
@@ -2087,7 +2086,7 @@ async function migrateCaregiversForUser(
     .equalTo(userId)
     .once("value");
   const caregiverVal = caregiverSnap.val() || {};
-  // Convert to array
+  // Convert to array with key as 'id'
   for (const [key, val] of Object.entries(caregiverVal)) {
     allCaregiversArray.push({ id: key, ...(val as any) });
   }
@@ -2103,29 +2102,22 @@ async function migrateCaregiversForUser(
     allCaregiversArray.push({ id: key, ...(val as any) });
   }
 
-  // 2) Build a multi-loc updates object for new DB
+  // 2) Build a multi-location updates object for new DB
   const multiLocUpdates: Record<string, any> = {};
 
-  // 3) Filter out duplicates if the same record might appear in both queries
+  // 3) Filter out duplicates using the 'id' property
   const uniqueCaregiversMap = new Map<string, any>();
   for (const caregiver of allCaregiversArray) {
-    uniqueCaregiversMap.set(caregiver.caregiverKey, caregiver);
+    uniqueCaregiversMap.set(caregiver.id, caregiver);
   }
   const uniqueCaregivers = Array.from(uniqueCaregiversMap.values());
 
-  // 4) For each caregiver record, transform as needed
+  // 4) For each caregiver record, transform as needed and store it
   for (const oldCaregiver of uniqueCaregivers) {
-    // Example: transform or rename fields if needed, or just store them
-    // We'll pick a new ID or reuse the old key
-    const newCaregiverId = oldCaregiver.caregiverKey;
-
-    // This is a minimal transform; adjust as needed
+    const newCaregiverId = oldCaregiver.id;
     const newCaregiverObj = {
-      // Keep all old fields as is
       ...oldCaregiver,
     };
-
-    // store in /caregiver/newCaregiverId
     multiLocUpdates[`/caregiver/${newCaregiverId}`] = newCaregiverObj;
   }
 
