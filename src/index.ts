@@ -142,7 +142,7 @@ function checkForOutStandingNotifications() {
   ]);
 }
 
-const checkEventDoses = async () => {
+export const checkEventDoses = async () => {
   const currentTime = Date.now();
   const startOfMinute = getStartOfMinute(currentTime);
   const endOfMinute = getEndOfMinute(currentTime);
@@ -160,24 +160,70 @@ const checkEventDoses = async () => {
     const event = childSnapshot.val();
     const eventId = childSnapshot.key;
     if (event.state === "active" && !event.nextNotificationTime) {
-      const promise = getChild(event.childId)
-        .then((child) => {
+      const promise = (async () => {
+        let child: any;
+        let parent: any;
+        let notificationBody = "";
+
+        // Step 1: Fetch child data
+        try {
+          child = await getChild(event.childId);
           if (!child) {
             throw new Error(`Child not found for ID ${event.childId}`);
           }
-          return getUser(child.parentId).then(async (parent) => {
+        } catch (error) {
+          logger.error(`Error fetching child for event ${eventId}:`, error);
+        }
+
+        // Step 2: Fetch parent data
+        try {
+          if (child) {
+            parent = await getUser(child.parentId);
             if (!parent) {
               throw new Error(`Parent not found for ID ${child.parentId}`);
             }
+          }
+        } catch (error) {
+          logger.error(`Error fetching parent for event ${eventId}:`, error);
+        }
 
-            // Prepare notification message
-            const notificationBody = `${
+        // Step 3: Prepare notification message
+        try {
+          if (child) {
+            notificationBody = `${
               child.childName
             } can get the next ${capitalizeFirstLetter(
               event.cycle
             )} dose now. Tap to give the dose.`;
+          }
+        } catch (error) {
+          logger.error(
+            `Error building notification for event ${eventId}:`,
+            error
+          );
+        }
 
-            // Fetch care family members
+        // Step 4: Send notification to parent if allowed
+        try {
+          if (parent && parent.allowsPushNotifications && notificationBody) {
+            await sendPushNotificationsToUser(parent.uid, notificationBody, {
+              childId: event.childId,
+              eventId: eventId,
+              screen: "EpisodeSchedule",
+            });
+          }
+        } catch (error) {
+          logger.error(
+            `Error sending notification to parent ${
+              parent ? parent.uid : "unknown"
+            } for event ${eventId}:`,
+            error
+          );
+        }
+
+        // Step 5: Send notifications to eligible care team members
+        try {
+          if (child) {
             const careFamilyMembers = await fetchCareFamilyMembers(
               child.parentId,
               event.childId
@@ -185,50 +231,51 @@ const checkEventDoses = async () => {
             const eligibleMembers = careFamilyMembers.filter(
               (member) => member.allowsPushNotifications
             );
-
-            // Send notification to parent if they allow push notifications
-            if (parent.allowsPushNotifications) {
-              await sendPushNotificationsToUser(parent.uid, notificationBody, {
-                childId: event.childId,
-                eventId: eventId,
-                screen: "EpisodeSchedule",
-              });
-            }
-
-            // Send notifications to eligible care family members
-            const memberPromises = eligibleMembers.map((member) =>
-              sendPushNotificationsToUser(member.uid, notificationBody, {
-                childId: event.childId,
-                eventId: eventId,
-                screen: "EpisodeSchedule",
-              })
+            const memberResults = await Promise.allSettled(
+              eligibleMembers.map((member) =>
+                sendPushNotificationsToUser(member.uid, notificationBody, {
+                  childId: event.childId,
+                  eventId: eventId,
+                  screen: "EpisodeSchedule",
+                })
+              )
             );
-            await Promise.all(memberPromises);
-
-            // Update nextNotificationTime and notificationCount
-            const nextNotificationTime = currentTime + 10 * 60 * 1000; // Add 10 minutes
-            return db
-              .ref(`events/${childSnapshot.key}`)
-              .update({ nextNotificationTime, notificationCount: 1 });
-          });
-        })
-        .catch((error) => {
+            memberResults.forEach((result) => {
+              if (result.status === "rejected") {
+                logger.error(
+                  `Error sending notification to a care team member for event ${eventId}:`,
+                  result.reason
+                );
+              }
+            });
+          }
+        } catch (error) {
           logger.error(
-            `checkEventDoses Error for childId: ${event.childId}`,
+            `Error processing care team notifications for event ${eventId}:`,
             error
           );
-        });
+        }
 
+        // Step 6: Update nextNotificationTime and notificationCount.
+        // This update should occur regardless of previous errors.
+        const nextNotificationTime = currentTime + 10 * 60 * 1000; // Add 10 minutes
+        try {
+          return await db
+            .ref(`events/${childSnapshot.key}`)
+            .update({ nextNotificationTime, notificationCount: 1 });
+        } catch (updateError) {
+          logger.error(`Error updating event ${eventId}:`, updateError);
+        }
+      })();
       promises.push(promise);
     }
   });
 
   await Promise.all(promises);
-
   return null;
 };
 
-const checkNextNotificationTime = async () => {
+export const checkNextNotificationTime = async () => {
   const currentTime = Date.now();
   const startOfMinute = getStartOfMinute(currentTime);
   const endOfMinute = getEndOfMinute(currentTime);
@@ -245,21 +292,73 @@ const checkNextNotificationTime = async () => {
   snapshot.forEach((childSnapshot) => {
     const event = childSnapshot.val();
     const eventId = childSnapshot.key;
+
     if (
       event.state === "active" &&
       event.nextNotificationTime &&
       event.notificationCount <= 5
     ) {
-      const promise = getChild(event.childId)
-        .then((child) => {
-          if (!child)
+      const promise = (async () => {
+        let child: any;
+        let parent: any;
+        let notificationBody = "";
+
+        // 1) Get child data
+        try {
+          child = await getChild(event.childId);
+          if (!child) {
             throw new Error(`Child not found for ID ${event.childId}`);
+          }
+        } catch (error) {
+          logger.error(`Error fetching child for event ${eventId}:`, error);
+        }
 
-          return getUser(child.parentId).then(async (parent) => {
-            if (!parent)
+        // 2) Get parent data
+        try {
+          if (child) {
+            parent = await getUser(child.parentId);
+            if (!parent) {
               throw new Error(`Parent not found for ID ${child.parentId}`);
+            }
+          }
+        } catch (error) {
+          logger.error(`Error fetching parent for event ${eventId}:`, error);
+        }
 
-            // Fetch care family members
+        // 3) Prepare notification message using child and event info
+        try {
+          if (child) {
+            // Send notification to parent if they allow push notifications
+            notificationBody = getNotificationMessage(child, event);
+          }
+        } catch (error) {
+          logger.error(
+            `Error building notification message for event ${eventId}:`,
+            error
+          );
+        }
+
+        // 4) Send notification to parent if allowed
+        try {
+          if (parent && parent.allowsPushNotifications && notificationBody) {
+            await sendPushNotificationsToUser(parent.uid, notificationBody, {
+              childId: event.childId,
+              eventId: eventId,
+              screen: "EpisodeSchedule",
+            });
+          }
+        } catch (error) {
+          logger.error(
+            `Error sending notification to parent ${
+              parent ? parent.uid : "unknown"
+            } for event ${eventId}:`,
+            error
+          );
+        }
+
+        // 5) Send notifications to eligible care team members
+        try {
+          if (child) {
             const careFamilyMembers = await fetchCareFamilyMembers(
               child.parentId,
               event.childId
@@ -267,53 +366,54 @@ const checkNextNotificationTime = async () => {
             const eligibleMembers = careFamilyMembers.filter(
               (member) => member.allowsPushNotifications
             );
-
-            // Send notification to parent if they allow push notifications
-            const notificationBody = getNotificationMessage(child, event);
-
-            if (parent.allowsPushNotifications) {
-              await sendPushNotificationsToUser(parent.uid, notificationBody, {
-                childId: event.childId,
-                eventId: eventId,
-                screen: "EpisodeSchedule",
-              });
-            }
-
-            // Send notification to eligible care family members
-            const memberPromises = eligibleMembers.map((member) =>
-              sendPushNotificationsToUser(member.uid, notificationBody, {
-                childId: event.childId,
-                eventId: eventId,
-                screen: "EpisodeSchedule",
-              })
+            const memberResults = await Promise.allSettled(
+              eligibleMembers.map((member) =>
+                sendPushNotificationsToUser(member.uid, notificationBody, {
+                  childId: event.childId,
+                  eventId: eventId,
+                  screen: "EpisodeSchedule",
+                })
+              )
             );
-            await Promise.all(memberPromises);
-
-            // Update next notification time after sending
-            return updateEventNotificationCount(
-              event,
-              childSnapshot.key,
-              currentTime
-            );
-          });
-        })
-        .catch((error) => {
+            memberResults.forEach((result) => {
+              if (result.status === "rejected") {
+                logger.error(
+                  `Error sending notification to care team member for event ${eventId}:`,
+                  result.reason
+                );
+              }
+            });
+          }
+        } catch (error) {
           logger.error(
-            `checkNextNotificationTime Error for childId: ${event.childId}`,
+            `Error processing care team notifications for event ${eventId}:`,
             error
           );
-        });
+        }
 
+        // 6) Update nextNotificationTime and notificationCount using your updateEventNotificationCount function.
+        try {
+          return await updateEventNotificationCount(
+            event,
+            childSnapshot.key,
+            currentTime
+          );
+        } catch (updateError) {
+          logger.error(
+            `Error updating event ${eventId} in checkNextNotificationTime:`,
+            updateError
+          );
+        }
+      })();
       promises.push(promise);
     }
   });
 
   await Promise.all(promises);
-
   return null;
 };
 
-const processPrescriptionEvents = async () => {
+export const processPrescriptionEvents = async () => {
   const currentTime = Date.now();
   const startOfMinute = getStartOfMinute(currentTime);
   const endOfMinute = getEndOfMinute(currentTime);
@@ -332,26 +432,86 @@ const processPrescriptionEvents = async () => {
     const eventId = childSnapshot.key;
 
     if (event.state === "active" && !event.nextNotificationTime) {
-      const promise = getChild(event.childId)
-        .then((child) => {
+      const promise = (async () => {
+        // Declare local variables for this event's processing.
+        let child: any;
+        let parent: any;
+        let prescription: any;
+        const notificationBodyParts: {
+          childName?: string;
+          prescriptionName?: string;
+        } = {};
+
+        // Attempt to fetch child data.
+        try {
+          child = await getChild(event.childId);
           if (!child) {
             throw new Error(`Child not found for ID ${event.childId}`);
           }
-          return getUser(child.parentId).then(async (parent) => {
+          notificationBodyParts.childName = child.childName;
+        } catch (error) {
+          logger.error(`Error fetching child for event ${eventId}:`, error);
+        }
+
+        // Attempt to fetch parent data.
+        try {
+          if (child) {
+            parent = await getUser(child.parentId);
             if (!parent) {
               throw new Error(`Parent not found for ID ${child.parentId}`);
             }
+          }
+        } catch (error) {
+          logger.error(`Error fetching parent for event ${eventId}:`, error);
+        }
 
-            const prescription = await getPrescription(event.prescriptionId);
+        // Attempt to fetch prescription details.
+        try {
+          prescription = await getPrescription(event.prescriptionId);
+          if (prescription) {
+            notificationBodyParts.prescriptionName = prescription.name;
+          }
+        } catch (error) {
+          logger.error(
+            `Error fetching prescription for event ${eventId}:`,
+            error
+          );
+        }
 
-            // Prepare notification message
-            const notificationBody = `It's time for ${
-              child.childName
-            }'s next dose of ${capitalizeFirstLetter(
-              prescription.name
-            )}. Tap to give the dose.`;
+        // Prepare notification message if we have necessary parts.
+        let notificationBody = "";
+        if (
+          notificationBodyParts.childName &&
+          notificationBodyParts.prescriptionName
+        ) {
+          notificationBody = `It's time for ${
+            notificationBodyParts.childName
+          }'s next dose of ${capitalizeFirstLetter(
+            notificationBodyParts.prescriptionName
+          )}. Tap to give the dose.`;
+        }
 
-            // Fetch care team members
+        // Send notification to parent if allowed.
+        try {
+          if (parent && parent.allowsPushNotifications && notificationBody) {
+            await sendPushNotificationsToUser(parent.uid, notificationBody, {
+              childId: event.childId,
+              eventId: eventId,
+              screen: "PrimarySchedule",
+            });
+          }
+        } catch (error) {
+          logger.error(
+            `Error sending notification to parent ${
+              parent ? parent.uid : "unknown"
+            }`,
+            error
+          );
+        }
+
+        // Send notifications to eligible care team members.
+        try {
+          if (child) {
             const careFamilyMembers = await fetchCareFamilyMembers(
               child.parentId,
               event.childId
@@ -359,50 +519,55 @@ const processPrescriptionEvents = async () => {
             const eligibleMembers = careFamilyMembers.filter(
               (member) => member.allowsPushNotifications
             );
-
-            // Send notification to caregiver if they allow push notifications
-            if (parent.allowsPushNotifications) {
-              await sendPushNotificationsToUser(parent.uid, notificationBody, {
-                childId: event.childId,
-                eventId: eventId,
-                screen: "PrimarySchedule",
-              });
-            }
-
-            // Send notifications to eligible care team members
-            const memberPromises = eligibleMembers.map((member) =>
-              sendPushNotificationsToUser(member.uid, notificationBody, {
-                childId: event.childId,
-                eventId: eventId,
-                screen: "PrimarySchedule",
-              })
+            const memberResults = await Promise.allSettled(
+              eligibleMembers.map((member) =>
+                sendPushNotificationsToUser(member.uid, notificationBody, {
+                  childId: event.childId,
+                  eventId: eventId,
+                  screen: "PrimarySchedule",
+                })
+              )
             );
-            await Promise.all(memberPromises);
-
-            // Update nextNotificationTime and notificationCount
-            const nextNotificationTime = currentTime + 10 * 60 * 1000; // Add 10 minutes
-            return db
-              .ref(`prescription_events/${childSnapshot.key}`)
-              .update({ nextNotificationTime, notificationCount: 1 });
-          });
-        })
-        .catch((error) => {
+            memberResults.forEach((result) => {
+              if (result.status === "rejected") {
+                logger.error(
+                  `Error sending notification to care team member:`,
+                  result.reason,
+                  eventId
+                );
+              }
+            });
+          }
+        } catch (error) {
           logger.error(
-            `Error processing prescription dose for child: ${event.childId}`,
+            `Error processing care team notifications for event ${eventId}`,
             error
           );
-        });
+        }
+
+        // Finally, update the event.
+        const nextNotificationTime = currentTime + 10 * 60 * 1000; // 10 minutes later
+        try {
+          await db
+            .ref(`prescription_events/${childSnapshot.key}`)
+            .update({ nextNotificationTime, notificationCount: 1 });
+        } catch (updateError) {
+          logger.error(
+            `Error updating prescription event for child ${event.childId}:`,
+            updateError
+          );
+        }
+      })();
 
       promises.push(promise);
     }
   });
 
   await Promise.all(promises);
-
   return null;
 };
 
-const processPrescriptionNextNotificationTime = async () => {
+export const processPrescriptionNextNotificationTime = async () => {
   const currentTime = Date.now();
   const startOfMinute = getStartOfMinute(currentTime);
   const endOfMinute = getEndOfMinute(currentTime);
@@ -424,75 +589,133 @@ const processPrescriptionNextNotificationTime = async () => {
       event.nextNotificationTime &&
       event.notificationCount <= 5
     ) {
-      const promise = getChild(event.childId)
-        .then((child) => {
-          if (!child)
+      const promise = (async () => {
+        // Local variables for this event's processing.
+        let child: any;
+        let parent: any;
+        let prescription: any;
+        let notificationBody = "";
+
+        // 1) Get the child data
+        try {
+          child = await getChild(event.childId);
+          if (!child) {
             throw new Error(`Child not found for ID ${event.childId}`);
+          }
+        } catch (err) {
+          logger.error(`Error fetching child for event ${eventId}:`, err);
+        }
 
-          return getUser(child.parentId).then(async (parent) => {
-            if (!parent)
+        // 2) Get the parent data
+        try {
+          if (child) {
+            parent = await getUser(child.parentId);
+            if (!parent) {
               throw new Error(`Parent not found for ID ${child.parentId}`);
+            }
+          }
+        } catch (err) {
+          logger.error(`Error fetching parent for event ${eventId}:`, err);
+        }
 
-            // Fetch care family members
+        // 3) Get prescription details
+        try {
+          prescription = await getPrescription(event.prescriptionId);
+        } catch (err) {
+          logger.error(
+            `Error fetching prescription for event ${eventId}:`,
+            err
+          );
+        }
+
+        // 4) Prepare notification message (if we have child and prescription data)
+        if (child && prescription) {
+          notificationBody = prescriptionNotification(
+            child.childName,
+            event.notificationCount,
+            prescription.name
+          );
+        }
+
+        // 5) Send notification to parent if allowed
+        try {
+          if (parent && parent.allowsPushNotifications && notificationBody) {
+            await sendPushNotificationsToUser(parent.uid, notificationBody, {
+              childId: event.childId,
+              eventId: eventId,
+              screen: "PrimarySchedule",
+            });
+          }
+        } catch (err) {
+          logger.error(
+            `Error sending notification to parent ${
+              parent ? parent.uid : "unknown"
+            }`,
+            err
+          );
+        }
+
+        // 6) Send notifications to eligible care team members
+        try {
+          if (child) {
             const careFamilyMembers = await fetchCareFamilyMembers(
               child.parentId,
               event.childId
             );
-
             const eligibleMembers = careFamilyMembers.filter(
               (member) => member.allowsPushNotifications
             );
-
-            const prescription = await getPrescription(event.prescriptionId);
-
-            // Send notification to parent if they allow push notifications
-            const notificationBody = prescriptionNotification(
-              child.childName,
-              event.notificationCount,
-              prescription.name
+            const memberResults = await Promise.allSettled(
+              eligibleMembers.map((member) =>
+                sendPushNotificationsToUser(member.uid, notificationBody, {
+                  childId: event.childId,
+                  eventId: eventId,
+                  screen: "PrimarySchedule",
+                })
+              )
             );
-
-            if (parent.allowsPushNotifications) {
-              await sendPushNotificationsToUser(parent.uid, notificationBody, {
-                childId: event.childId,
-                eventId: eventId,
-                screen: "PrimarySchedule",
-              });
-            }
-
-            // Send notification to eligible care family members
-            const memberPromises = eligibleMembers.map((member) =>
-              sendPushNotificationsToUser(member.uid, notificationBody, {
-                childId: event.childId,
-                eventId: eventId,
-                screen: "PrimarySchedule",
-              })
-            );
-            await Promise.all(memberPromises);
-
-            // Update next notification time after sending
-            return updatePrescriptionEventNotificationCount(
-              event,
-              eventId,
-              currentTime,
-              prescription,
-              parent.timeZone
-            );
-          });
-        })
-        .catch((error) => {
+            memberResults.forEach((result) => {
+              if (result.status === "rejected") {
+                logger.error(
+                  `Error sending notification to a care team member:`,
+                  result.reason
+                );
+              }
+            });
+          }
+        } catch (err) {
           logger.error(
-            `Error processing dose for childId: ${event.childId}`,
-            error
+            `Error processing care team notifications for event ${eventId}`,
+            err
           );
-        });
+        }
 
+        // Always call updatePrescriptionEventNotificationCount.
+        // This ensures that even if some notifications fail, the event update is attempted.
+        try {
+          // Use parent's timeZone if available, otherwise default to "UTC"
+          const effectiveTimeZone =
+            parent && parent.timeZone ? parent.timeZone : "UTC";
+          return updatePrescriptionEventNotificationCount(
+            event,
+            eventId,
+            currentTime,
+            prescription,
+            effectiveTimeZone
+          );
+        } catch (updateError) {
+          logger.error(
+            `Error updating prescription event for child ${event.childId}:`,
+            updateError,
+            eventId
+          );
+        }
+      })();
       promises.push(promise);
     }
   });
 
   await Promise.all(promises);
-
   return null;
 };
 
