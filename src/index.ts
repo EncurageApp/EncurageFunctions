@@ -2216,6 +2216,20 @@ exports.convertOnCureUser = v1.https.onCall(async (data, context) => {
       "internal",
       (error as Error)?.message || "Unknown error."
     );
+  } finally {
+    // Final step: update onCureDb to set allowsPushNotifications to false.
+    try {
+      await onCureDb.ref(`/users/${userId}/allowsPushNotifications`).set(false);
+      logger.log(
+        `Set allowsPushNotifications to false for user ${userId} in onCureDb.`
+      );
+    } catch (err) {
+      logger.error(
+        `Error updating onCureDb allowsPushNotifications for user ${userId}:`,
+        err
+      );
+      // Do not rethrow so that this step does not stop the overall function.
+    }
   }
 });
 
