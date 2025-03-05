@@ -650,6 +650,8 @@ export const processPrescriptionNextNotificationTime = async () => {
           logger.error(
             `Error sending notification to parent ${
               parent ? parent.uid : "unknown"
+            }, for event: ${eventId ? eventId : "unknown"}, for child: ${
+              event.childId ? event.childId : "unknown"
             }`,
             err
           );
@@ -942,9 +944,8 @@ async function sendPushNotificationsToUser(
   payload: string,
   data?: any
 ) {
-  let recipientPushToken = "";
+  const pushTokensRef = db.ref(`/users/${userId}/pushToken`);
   try {
-    const pushTokensRef = db.ref(`/users/${userId}/pushToken`);
     const snapshot = await pushTokensRef.once("value");
     if (!snapshot.exists()) {
       logger.log(
@@ -953,7 +954,7 @@ async function sendPushNotificationsToUser(
       return { successCount: 0, failureCount: 0, results: [] };
     }
 
-    recipientPushToken = snapshot.val();
+    const recipientPushToken = snapshot.val();
     const threadId = data?.eventId;
 
     const androidConfig: admin.messaging.AndroidConfig = {
@@ -972,13 +973,24 @@ async function sendPushNotificationsToUser(
       },
     };
 
+    // Convert data values to strings and skip null/undefined values
+    const stringData: Record<string, string> = {};
+    if (data) {
+      Object.keys(data).forEach((key) => {
+        const value = data[key];
+        if (value !== null && value !== undefined) {
+          stringData[key] = String(value);
+        }
+      });
+    }
+
     const message: admin.messaging.Message = {
       token: recipientPushToken,
       notification: {
         title: "Encurage",
         body: payload,
       },
-      data: { ...data },
+      data: stringData,
       android: androidConfig,
       apns: iosConfig,
     };
@@ -987,10 +999,13 @@ async function sendPushNotificationsToUser(
     logger.log(`Successfully sent message:`, response);
     return response;
   } catch (error) {
-    logger.error(
-      `Error sending push notification for user ${userId} with token ${recipientPushToken}:`,
-      error
-    );
+    if (
+      error.errorInfo?.code === "messaging/registration-token-not-registered"
+    ) {
+      logger.error(`Token not registered for user ${userId}. Removing token.`);
+      await pushTokensRef.remove();
+    }
+    logger.error(`Error sending push notification for user ${userId}`, error);
     throw error;
   }
 }
