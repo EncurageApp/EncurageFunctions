@@ -1,0 +1,23 @@
+# Ignore node_modules - they are rebuilt in the cloud
+node_modules/
+
+# Ignore build artifacts
+lib/
+build/
+dist/
+.eslintcache
+
+# Ignore git and IDE files
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Ignore local environment and configs
+.env
+.env.*
+firebase-debug.log
+npm-debug.log
+
+# Ignore macOS junk
+.DS_Store

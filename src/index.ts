@@ -98,18 +98,25 @@ export const deleteExpiredCodesCron = v1.pubsub
     }
   });
 //
-export const pushCron = v1.pubsub.schedule("*/1 * * * *").onRun((context) => {
-  logger.log("minute_job ran");
-  return checkForOutStandingNotifications()
-    .then((result) => {
-      logger.log("minute_job finished", { result });
-      return result;
-    })
-    .catch((error) => {
-      logger.log("minute_job error", error);
-      return error;
-    });
-});
+
+export const pushCron = v1
+  .runWith({
+    timeoutSeconds: 300,
+    memory: "512MB",
+  })
+  .pubsub.schedule("*/1 * * * *")
+  .onRun((context) => {
+    logger.log("minute_job ran");
+    return checkForOutStandingNotifications()
+      .then((result) => {
+        logger.log("minute_job finished", { result });
+        return result;
+      })
+      .catch((error) => {
+        logger.log("minute_job error", error);
+        return error;
+      });
+  });
 
 function checkForOutStandingNotifications() {
   return Promise.all([
@@ -2144,109 +2151,113 @@ async function validateGoogleReceipt(purchaseToken, packageName, productId) {
 
 // ****************************************************** Start Data Migration ********************************
 
-exports.convertOnCureUser = v1.https.onCall(async (data, context) => {
-  const { appVersion, timeZone } = data;
-  if (!context.auth) {
-    throw new v1.https.HttpsError(
-      "unauthenticated",
-      "Function must be called while authenticated."
-    );
-  }
-
-  const userId = context.auth.uid;
-  logger.log("userId", userId);
-
-  try {
-    // 1) Fetch old user
-    const userSnap = await onCureDb.ref(`/users/${userId}`).once("value");
-    if (!userSnap.exists()) {
-      throw new v1.https.HttpsError("not-found", `User ${userId} not found`);
-    }
-    const oldUserData = userSnap.val();
-
-    // 2) Fetch children
-    const childrenSnap = await onCureDb
-      .ref("/children")
-      .orderByChild("parent_id")
-      .equalTo(userId)
-      .once("value");
-
-    const childrenData = (childrenSnap.val() || {}) as Record<
-      string,
-      ChildData
-    >;
-    const childIds = Object.keys(childrenData);
-
-    // 3) Transform user
-    const email = context.auth.token.email;
-    const newUser = transformOnCureUser(
-      oldUserData,
-      userId,
-      email,
-      childIds,
-      appVersion
-    );
-
-    // 4) Prepare big updates
-    const updates: Record<string, any> = {};
-    updates[`/users/${userId}`] = { ...newUser, converted: true };
-
-    // 5) For each child, transform & migrate child + old symptoms
-    for (const [childId, childObj] of Object.entries(childrenData)) {
-      // A) Migrate child + symptoms
-      const childUpdates = await transformAndMigrateChild(
-        childObj,
-        childId,
-        appVersion
-        // timeZone
+exports.convertOnCureUser = v1
+  .runWith({ timeoutSeconds: 180 })
+  .https.onCall(async (data, context) => {
+    const { appVersion, timeZone } = data;
+    if (!context.auth) {
+      throw new v1.https.HttpsError(
+        "unauthenticated",
+        "Function must be called while authenticated."
       );
-      Object.assign(updates, childUpdates);
-
-      // B) Migrate old journals for this child
-      const journalUpdates = await migrateJournalsForChild(childId);
-      Object.assign(updates, journalUpdates);
-
-      // C) Migrate prescriptions for this child
-      const prescriptionUpdates = await migratePrescriptionsForChild(
-        childId,
-        timeZone
-      );
-      Object.assign(updates, prescriptionUpdates);
     }
 
-    const caregiverUpdates = await migrateCaregiversForUser(userId);
-    Object.assign(updates, caregiverUpdates);
+    const userId = context.auth.uid;
+    logger.log("userId", userId);
 
-    // 6) Write all at once
-    await db.ref().update(updates);
-
-    return {
-      message: "Success",
-      user: newUser,
-      childrenCount: childIds.length,
-    };
-  } catch (error) {
-    console.error("Error in convertOnCureUser:", error);
-    throw new v1.https.HttpsError(
-      "internal",
-      (error as Error)?.message || "Unknown error."
-    );
-  } finally {
-    // Final step: update onCureDb to set allowsPushNotifications to false.
     try {
-      await onCureDb.ref(`/users/${userId}/allowsPushNotifications`).set(false);
-      logger.log(
-        `Set allowsPushNotifications to false for user ${userId} in onCureDb.`
+      // 1) Fetch old user
+      const userSnap = await onCureDb.ref(`/users/${userId}`).once("value");
+      if (!userSnap.exists()) {
+        throw new v1.https.HttpsError("not-found", `User ${userId} not found`);
+      }
+      const oldUserData = userSnap.val();
+
+      // 2) Fetch children
+      const childrenSnap = await onCureDb
+        .ref("/children")
+        .orderByChild("parent_id")
+        .equalTo(userId)
+        .once("value");
+
+      const childrenData = (childrenSnap.val() || {}) as Record<
+        string,
+        ChildData
+      >;
+      const childIds = Object.keys(childrenData);
+
+      // 3) Transform user
+      const email = context.auth.token.email;
+      const newUser = transformOnCureUser(
+        oldUserData,
+        userId,
+        email,
+        childIds,
+        appVersion
       );
-    } catch (err) {
-      logger.error(
-        `Error updating onCureDb allowsPushNotifications for user ${userId}:`,
-        err
+
+      // 4) Prepare big updates
+      const updates: Record<string, any> = {};
+      updates[`/users/${userId}`] = { ...newUser, converted: true };
+
+      // 5) For each child, transform & migrate child + old symptoms
+      for (const [childId, childObj] of Object.entries(childrenData)) {
+        // A) Migrate child + symptoms
+        const childUpdates = await transformAndMigrateChild(
+          childObj,
+          childId,
+          appVersion
+          // timeZone
+        );
+        Object.assign(updates, childUpdates);
+
+        // B) Migrate old journals for this child
+        const journalUpdates = await migrateJournalsForChild(childId);
+        Object.assign(updates, journalUpdates);
+
+        // C) Migrate prescriptions for this child
+        const prescriptionUpdates = await migratePrescriptionsForChild(
+          childId,
+          timeZone
+        );
+        Object.assign(updates, prescriptionUpdates);
+      }
+
+      const caregiverUpdates = await migrateCaregiversForUser(userId);
+      Object.assign(updates, caregiverUpdates);
+      logger.log("caregiverUpdates", caregiverUpdates);
+      // 6) Write all at once
+      await db.ref().update(updates);
+
+      return {
+        message: "Success",
+        user: newUser,
+        childrenCount: childIds.length,
+      };
+    } catch (error) {
+      console.error("Error in convertOnCureUser:", error);
+      throw new v1.https.HttpsError(
+        "internal",
+        (error as Error)?.message || "Unknown error."
       );
-      // Do not rethrow so that this step does not stop the overall function.
+    } finally {
+      // Final step: update onCureDb to set allowsPushNotifications to false.
+      try {
+        await onCureDb
+          .ref(`/users/${userId}/allowsPushNotifications`)
+          .set(false);
+        logger.log(
+          `Set allowsPushNotifications to false for user ${userId} in onCureDb.`
+        );
+      } catch (err) {
+        logger.error(
+          `Error updating onCureDb allowsPushNotifications for user ${userId}:`,
+          err
+        );
+        // Do not rethrow so that this step does not stop the overall function.
+      }
     }
-  }
-});
+  });
 
 //************* User data ******************/
 
@@ -2342,6 +2353,7 @@ export async function migrateCaregiversForUser(
     .equalTo(userId)
     .once("value");
   const caregiverVal = caregiverSnap.val() || {};
+  logger.log("caregiverVal", caregiverVal);
   // Convert to array with key as 'id'
   for (const [key, val] of Object.entries(caregiverVal)) {
     allCaregiversArray.push({ id: key, ...(val as any) });
@@ -2367,6 +2379,7 @@ export async function migrateCaregiversForUser(
     uniqueCaregiversMap.set(caregiver.id, caregiver);
   }
   const uniqueCaregivers = Array.from(uniqueCaregiversMap.values());
+  logger.log("uniqueCaregivers", uniqueCaregivers);
 
   // 4) For each caregiver record, transform as needed and store it
   for (const oldCaregiver of uniqueCaregivers) {
@@ -3359,7 +3372,7 @@ async function migratePrescriptionsForChild(childId: string, timeZone: string) {
 
     // 4) Create the event object
     let newEvent = createPrescriptionEvent(newPres, oldPres, timeZone);
-
+    logger.log("newEvent", newEvent);
     // We'll give it an ID (eventId)
     const newEventId = `pe-${newId}`;
     newEvent.eventId = newEventId!;
@@ -3376,6 +3389,7 @@ async function migratePrescriptionsForChild(childId: string, timeZone: string) {
 
     const oldDoses = dosesSnap.val() || {};
 
+    logger.log("oldDoses", oldDoses);
     // Convert => array
     const oldDosesArray = Object.entries(oldDoses).map(([doseId, doseVal]) => ({
       doseId,
@@ -3389,7 +3403,7 @@ async function migratePrescriptionsForChild(childId: string, timeZone: string) {
     const newDoses = givenDoses.map((oldDose) =>
       transformOldPrescriptionDoseToNew(oldDose, newPres, newEventId)
     );
-
+    logger.log("newDoses", newDoses);
     for (const nd of newDoses) {
       const doseId = nd.id || db.ref().push().key;
       // e.g. "/prescription/{presId}/doses/{doseId}"
@@ -3579,6 +3593,7 @@ function createPrescriptionEvent(
 ): Prescription_events {
   logger.log();
   const nextDose = calculateNextDose(newPres, timeZone);
+  logger.log("nextDose", nextDose);
   const event: Prescription_events = {
     childId: newPres.childId,
     createDate: Date.now(), // You can also parse from oldPres if you want
