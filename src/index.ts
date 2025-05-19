@@ -1,6 +1,9 @@
+// function file
 import * as v1 from "firebase-functions/v1";
 // import * as v2 from "firebase-functions/v2";
-import * as logger from "firebase-functions/logger";
+import { onSchedule } from "firebase-functions/v2/scheduler";
+import { logger } from "firebase-functions";
+
 import * as admin from "firebase-admin";
 import moment from "moment-timezone";
 import axios from "axios";
@@ -58,95 +61,199 @@ const onCureDb = admin.app("onCureApp").database();
 //   return newFolderRef.key; // Return the unique key of the new folder
 // };
 
-export const deleteExpiredCodesCron = v1.pubsub
-  .schedule("0 0 * * *")
-  .onRun(async (context) => {
-    logger.log("daily_job ran");
+// export const deleteExpiredCodesCron = v1.pubsub
+//   .schedule("0 0 * * *")
+//   .onRun(async (context) => {
+//     logger.log("daily_job ran");
+
+//     const caregiverInviteRef = db.ref("caregiver_invite");
+//     const currentTime = Date.now();
+
+//     try {
+//       // Fetch all caregiver_invite entries
+//       const snapshot = await caregiverInviteRef.once("value");
+
+//       if (!snapshot.exists()) {
+//         logger.log("No caregiver invites found.");
+//         return null;
+//       }
+
+//       const expiredDeletes = [];
+//       snapshot.forEach((childSnapshot) => {
+//         const inviteData = childSnapshot.val();
+//         if (inviteData.expirationTime <= currentTime) {
+//           // Schedule deletion of expired code
+//           expiredDeletes.push(childSnapshot.ref.remove());
+//         }
+//       });
+
+//       // Execute all delete promises
+//       await Promise.all(expiredDeletes);
+
+//       logger.log("Expired codes deleted successfully.");
+//       return { message: "Expired codes cleanup completed" };
+//     } catch (error) {
+//       logger.error("Error deleting expired codes:", error);
+//       throw new v1.https.HttpsError(
+//         "internal",
+//         "An error occurred during expired code cleanup."
+//       );
+//     }
+//   });
+
+// export const pushCron = v1
+//   .runWith({
+//     timeoutSeconds: 300,
+//     memory: "512MB",
+//   })
+//   .pubsub.schedule("*/1 * * * *")
+//   .onRun((context) => {
+//     logger.log("minute_job ran");
+//     return checkForOutStandingNotifications()
+//       .then((result) => {
+//         logger.log("minute_job finished", { result });
+//         return result;
+//       })
+//       .catch((error) => {
+//         logger.log("minute_job error", error);
+//         return error;
+//       });
+//   });
+
+export const deleteExpiredCodesCron = onSchedule(
+  {
+    schedule: "0 0 * * *", // Every day at midnight
+    timeoutSeconds: 300,
+    memory: "256MiB",
+  },
+  async () => {
+    logger.log("🧹 deleteExpiredCodesCron started");
 
     const caregiverInviteRef = db.ref("caregiver_invite");
     const currentTime = Date.now();
 
     try {
-      // Fetch all caregiver_invite entries
       const snapshot = await caregiverInviteRef.once("value");
 
       if (!snapshot.exists()) {
-        logger.log("No caregiver invites found.");
-        return null;
+        logger.log("📭 No caregiver invites found.");
+        return;
       }
 
-      const expiredDeletes = [];
+      const expiredDeletes: Promise<void>[] = [];
+
       snapshot.forEach((childSnapshot) => {
         const inviteData = childSnapshot.val();
         if (inviteData.expirationTime <= currentTime) {
-          // Schedule deletion of expired code
           expiredDeletes.push(childSnapshot.ref.remove());
         }
       });
 
-      // Execute all delete promises
       await Promise.all(expiredDeletes);
 
-      logger.log("Expired codes deleted successfully.");
-      return { message: "Expired codes cleanup completed" };
-    } catch (error) {
-      logger.error("Error deleting expired codes:", error);
-      throw new v1.https.HttpsError(
-        "internal",
-        "An error occurred during expired code cleanup."
-      );
-    }
-  });
-//
-
-export const pushCron = v1
-  .runWith({
-    timeoutSeconds: 300,
-    memory: "512MB",
-  })
-  .pubsub.schedule("*/1 * * * *")
-  .onRun((context) => {
-    logger.log("minute_job ran");
-    return checkForOutStandingNotifications()
-      .then((result) => {
-        logger.log("minute_job finished", { result });
-        return result;
-      })
-      .catch((error) => {
-        logger.log("minute_job error", error);
-        return error;
+      logger.log("✅ Expired codes deleted successfully.");
+      return;
+    } catch (error: any) {
+      logger.error("❌ Error deleting expired codes:", {
+        message: error.message,
+        stack: error.stack,
       });
-  });
+      throw new Error("An error occurred during expired code cleanup.");
+    }
+  }
+);
 
-function checkForOutStandingNotifications() {
-  return Promise.all([
-    checkEventDoses().catch((error) => {
-      // Catch any error that occurs so we do not stop the prescription notifications
-      logger.error("An error occurred in checkForEventNotifications", error);
-      return error;
-    }),
-    checkNextNotificationTime().catch((error) => {
-      // Catch any error that occurs so we do not stop the event notifications
-      logger.error(
-        "An error occurred in checkForPrescriptionNotifications",
-        error
-      );
-      return error;
-    }),
-    processPrescriptionEvents().catch((error) => {
-      // Catch any error that occurs so we do not stop the event notifications
-      logger.error("An error occurred in processPrescriptionEvents", error);
-      return error;
-    }),
-    processPrescriptionNextNotificationTime().catch((error) => {
-      // Catch any error that occurs so we do not stop the event notifications
-      logger.error(
-        "An error occurred in processPrescriptionNextNotificationTime",
-        error
-      );
-      return error;
-    }),
-  ]);
+export const pushCron = onSchedule(
+  {
+    schedule: "*/1 * * * *",
+    timeoutSeconds: 540, // Max allowed for scheduler jobs
+    memory: "512MiB",
+  },
+  async () => {
+    logger.log("🕒 pushCron started");
+    try {
+      const result = await checkForOutStandingNotifications();
+      logger.log("✅ pushCron finished", { result });
+      return result;
+    } catch (error: any) {
+      logger.error("❌ pushCron error", error.message);
+      throw error;
+    }
+  }
+);
+
+// function checkForOutStandingNotifications() {
+//   return Promise.all([
+//     checkEventDoses().catch((error) => {
+//       // Catch any error that occurs so we do not stop the prescription notifications
+//       logger.error("An error occurred in checkForEventNotifications", error);
+//       return error;
+//     }),
+//     checkNextNotificationTime().catch((error) => {
+//       // Catch any error that occurs so we do not stop the event notifications
+//       logger.error(
+//         "An error occurred in checkForPrescriptionNotifications",
+//         error
+//       );
+//       return error;
+//     }),
+//     processPrescriptionEvents().catch((error) => {
+//       // Catch any error that occurs so we do not stop the event notifications
+//       logger.error("An error occurred in processPrescriptionEvents", error);
+//       return error;
+//     }),
+//     processPrescriptionNextNotificationTime().catch((error) => {
+//       // Catch any error that occurs so we do not stop the event notifications
+//       logger.error(
+//         "An error occurred in processPrescriptionNextNotificationTime",
+//         error
+//       );
+//       return error;
+//     }),
+//   ]);
+// }
+
+export async function checkForOutStandingNotifications(): Promise<void> {
+  const tasks = [
+    {
+      label: "checkEventDoses",
+      fn: checkEventDoses,
+    },
+    {
+      label: "checkNextNotificationTime",
+      fn: checkNextNotificationTime,
+    },
+    {
+      label: "processPrescriptionEvents",
+      fn: processPrescriptionEvents,
+    },
+    {
+      label: "processPrescriptionNextNotificationTime",
+      fn: processPrescriptionNextNotificationTime,
+    },
+  ];
+
+  const results = await Promise.allSettled(
+    tasks.map(async ({ label, fn }) => {
+      try {
+        const result = await fn();
+        logger.log(`✅ ${label} completed`);
+        return result;
+      } catch (err) {
+        logger.error(`❌ ${label} failed`, { error: err.message });
+        throw err; // optional: rethrow if you want failed count tracking
+      }
+    })
+  );
+
+  const failures = results.filter((res) => res.status === "rejected");
+  if (failures.length > 0) {
+    logger.warn(
+      `⚠️ ${failures.length} of ${tasks.length} notification sub-tasks failed.`
+    );
+  } else {
+    logger.log("✅ All notification sub-tasks completed successfully.");
+  }
 }
 
 export const checkEventDoses = async () => {
@@ -705,7 +812,7 @@ export const processPrescriptionNextNotificationTime = async () => {
           // Use parent's timeZone if available, otherwise default to "UTC"
           const effectiveTimeZone =
             parent && parent.timeZone ? parent.timeZone : "UTC";
-          return updatePrescriptionEventNotificationCount(
+          await updatePrescriptionEventNotificationCount(
             event,
             eventId,
             currentTime,
@@ -807,15 +914,15 @@ function updateEventNotificationCount(
   return db.ref(`events/${eventId}`).update(updates);
 }
 
-function updatePrescriptionEventNotificationCount(
+export async function updatePrescriptionEventNotificationCount(
   event: any,
   eventId: string,
   currentTime: number,
   prescription: any,
   timeZone: string
-) {
+): Promise<void> {
   let nextNotificationTime: number;
-  // Calculate next notification time based on notification count and snoozeInterval
+
   switch (event.notificationCount) {
     case 1:
       nextNotificationTime =
@@ -852,7 +959,6 @@ function updatePrescriptionEventNotificationCount(
       : { nextNotificationTime, notificationCount: newNotificationCount };
 
   if (newNotificationCount === 5) {
-    // Add a new dose to the "prescription_doses" collection
     const newDoseRef = db.ref("prescription_doses").push();
     const dose = {
       id: newDoseRef.key,
@@ -863,14 +969,14 @@ function updatePrescriptionEventNotificationCount(
       name: prescription.name,
       dose: prescription.dose,
     };
-    newDoseRef.set(dose);
-    // Update the event with a new nextScheduledDose time
+    await newDoseRef.set(dose);
+
     const timeStamp = calculateNextDose(prescription, timeZone);
     logger.log("timeStamp", timeStamp);
     updates.nextScheduledDose = timeStamp;
   }
 
-  return db.ref(`prescription_events/${eventId}`).update(updates);
+  await db.ref(`prescription_events/${eventId}`).update(updates);
 }
 
 const fetchCareFamilyMembers = async (parentId: string, childID: string) => {
@@ -958,7 +1064,7 @@ async function sendPushNotificationsToUser(
       logger.log(
         `No push token found for user ${userId}. Cannot send notification.`
       );
-      return { successCount: 0, failureCount: 0, results: [] };
+      return `No push token found for user ${userId}. Cannot send notification.`;
     }
 
     const recipientPushToken = snapshot.val();
@@ -981,6 +1087,7 @@ async function sendPushNotificationsToUser(
     };
 
     // Convert data values to strings and skip null/undefined values
+
     const stringData: Record<string, string> = {};
     if (data) {
       Object.keys(data).forEach((key) => {
@@ -2152,7 +2259,7 @@ async function validateGoogleReceipt(purchaseToken, packageName, productId) {
 // ****************************************************** Start Data Migration ********************************
 
 exports.convertOnCureUser = v1
-  .runWith({ timeoutSeconds: 180 })
+  .runWith({ timeoutSeconds: 240 })
   .https.onCall(async (data, context) => {
     const { appVersion, timeZone } = data;
     if (!context.auth) {
