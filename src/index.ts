@@ -1,124 +1,102 @@
 // function file
-import * as v1 from "firebase-functions/v1";
-// import * as v2 from "firebase-functions/v2";
-import { onSchedule } from "firebase-functions/v2/scheduler";
-import { logger } from "firebase-functions";
-
 import * as admin from "firebase-admin";
+import { logger } from "firebase-functions";
+import * as v1 from "firebase-functions/v1";
+import { onMessagePublished } from "firebase-functions/v2/pubsub";
+import { defineSecret } from "firebase-functions/params";
+import { onSchedule } from "firebase-functions/v2/scheduler";
+import { onCall, CallableRequest } from "firebase-functions/v2/https";
 import moment from "moment-timezone";
 import axios from "axios";
 import { google } from "googleapis";
 
-const serviceAccount = require("../oncure-app-firebase-adminsdk-j41yq-34921b17e4.json");
-
-// 1) Default app
-admin.initializeApp({
-  databaseURL: "https://encurage-new-default-rtdb.firebaseio.com",
-});
-
-// 2) Secondary app
-admin.initializeApp(
-  {
-    credential: admin.credential.cert(serviceAccount),
-    databaseURL: "https://oncure-app.firebaseio.com/",
-  },
-  "onCureApp"
+export const ONCURE_SERVICE_ACCOUNT_JSON = defineSecret(
+  "ONCURE_SERVICE_ACCOUNT_JSON"
 );
+
+// Default Encurage app
+if (!admin.apps.length) {
+  admin.initializeApp({
+    databaseURL: "https://encurage-new-default-rtdb.firebaseio.com",
+  });
+}
+
+// Safe onCureApp initialization
+try {
+  if (
+    process.env.ONCURE_SERVICE_ACCOUNT_JSON &&
+    !admin.apps.some((app) => app.name === "onCureApp")
+  ) {
+    const serviceAccount = JSON.parse(process.env.ONCURE_SERVICE_ACCOUNT_JSON);
+
+    admin.initializeApp(
+      {
+        credential: admin.credential.cert(serviceAccount),
+        databaseURL: "https://oncure-app.firebaseio.com/",
+      },
+      "onCureApp"
+    );
+
+    console.log("✅ onCureApp initialized");
+  } else {
+    console.log(
+      "⚠️ Skipping onCureApp initialization (already exists or missing secret)"
+    );
+  }
+} catch (err) {
+  console.error("❌ Failed to initialize onCureApp:", err);
+}
+
+export function getOnCureDb(): admin.database.Database | null {
+  if (admin.apps.some((app) => app.name === "onCureApp")) {
+    return admin.app("onCureApp").database();
+  }
+
+  console.warn("⚠️ onCureApp is not initialized");
+  return null;
+}
 
 // Get the database reference for each
 const db = admin.app().database();
-const onCureDb = admin.app("onCureApp").database();
+// const onCureDb = admin.app("onCureApp").database();
+const onCureDb = getOnCureDb();
 
 // Start writing functions
 // https://firebase.google.com/docs/functions/typescript
 
-// export const newChildAdded = v1.database
-//   .ref("children/{childId}")
-//   .onCreate(async (snapshot, context) => {
-//     const childId = context.params.childId; // Get the childId from the context
-//     // const child = snapshot.val();
+/*
+export const newChildAdded = v1.database
+  .ref("children/{childId}")
+  .onCreate(async (snapshot, context) => {
+    const childId = context.params.childId; // Get the childId from the context
+    // const child = snapshot.val();
 
-//     // Call the function to create a folder with the same childId
-//     await addFolderToChild(childId, "general");
+    // Call the function to create a folder with the same childId
+    await addFolderToChild(childId, "general");
 
-//     return null; // Indicate completion
-//   });
+    return null; // Indicate completion
+  });
 
-// Function to add a folder with a random ID to the child's folder array
-// const addFolderToChild = async (childId, folderName) => {
-//   // Reference to the child's folders array
-//   const folderRef = db.ref(`/folders/${childId}`);
+*/
 
-//   // Push a new folder with a random ID
-//   const newFolderRef = folderRef.push(); // This generates a unique ID for the folder
+/*
+Function to add a folder with a random ID to the child's folder array
+const addFolderToChild = async (childId, folderName) => {
+  // Reference to the child's folders array
+  const folderRef = db.ref(`/folders/${childId}`);
 
-//   await newFolderRef.set({
-//     id: newFolderRef.key, // Use the generated key as the folder ID
-//     name: folderName,
-//     createdAt: admin.database.ServerValue.TIMESTAMP,
-//   });
+  // Push a new folder with a random ID
+  const newFolderRef = folderRef.push(); // This generates a unique ID for the folder
 
-//   return newFolderRef.key; // Return the unique key of the new folder
-// };
+  await newFolderRef.set({
+    id: newFolderRef.key, // Use the generated key as the folder ID
+    name: folderName,
+    createdAt: admin.database.ServerValue.TIMESTAMP,
+  });
 
-// export const deleteExpiredCodesCron = v1.pubsub
-//   .schedule("0 0 * * *")
-//   .onRun(async (context) => {
-//     logger.log("daily_job ran");
-
-//     const caregiverInviteRef = db.ref("caregiver_invite");
-//     const currentTime = Date.now();
-
-//     try {
-//       // Fetch all caregiver_invite entries
-//       const snapshot = await caregiverInviteRef.once("value");
-
-//       if (!snapshot.exists()) {
-//         logger.log("No caregiver invites found.");
-//         return null;
-//       }
-
-//       const expiredDeletes = [];
-//       snapshot.forEach((childSnapshot) => {
-//         const inviteData = childSnapshot.val();
-//         if (inviteData.expirationTime <= currentTime) {
-//           // Schedule deletion of expired code
-//           expiredDeletes.push(childSnapshot.ref.remove());
-//         }
-//       });
-
-//       // Execute all delete promises
-//       await Promise.all(expiredDeletes);
-
-//       logger.log("Expired codes deleted successfully.");
-//       return { message: "Expired codes cleanup completed" };
-//     } catch (error) {
-//       logger.error("Error deleting expired codes:", error);
-//       throw new v1.https.HttpsError(
-//         "internal",
-//         "An error occurred during expired code cleanup."
-//       );
-//     }
-//   });
-
-// export const pushCron = v1
-//   .runWith({
-//     timeoutSeconds: 300,
-//     memory: "512MB",
-//   })
-//   .pubsub.schedule("*/1 * * * *")
-//   .onRun((context) => {
-//     logger.log("minute_job ran");
-//     return checkForOutStandingNotifications()
-//       .then((result) => {
-//         logger.log("minute_job finished", { result });
-//         return result;
-//       })
-//       .catch((error) => {
-//         logger.log("minute_job error", error);
-//         return error;
-//       });
-//   });
+  return newFolderRef.key; // Return the unique key of the new folder
+};
+*/
 
 export const deleteExpiredCodesCron = onSchedule(
   {
@@ -163,98 +141,137 @@ export const deleteExpiredCodesCron = onSchedule(
   }
 );
 
-export const pushCron = onSchedule(
+export const checkEventDosesCron = onSchedule(
   {
     schedule: "*/1 * * * *",
-    timeoutSeconds: 540, // Max allowed for scheduler jobs
+    timeZone: "America/New_York",
+    timeoutSeconds: 300,
     memory: "512MiB",
+    region: "us-central1",
   },
   async () => {
-    logger.log("🕒 pushCron started");
+    const start = Date.now();
+    logger.log("🕒 checkEventDosesCron started");
+
     try {
-      const result = await checkForOutStandingNotifications();
-      logger.log("✅ pushCron finished", { result });
-      return result;
-    } catch (error: any) {
-      logger.error("❌ pushCron error", error.message);
-      throw error;
+      await checkEventDoses();
+      logger.log(`✅ checkEventDosesCron completed in ${Date.now() - start}ms`);
+    } catch (err) {
+      logger.error("❌ checkEventDosesCron failed", err);
     }
   }
 );
 
-// function checkForOutStandingNotifications() {
-//   return Promise.all([
-//     checkEventDoses().catch((error) => {
-//       // Catch any error that occurs so we do not stop the prescription notifications
-//       logger.error("An error occurred in checkForEventNotifications", error);
-//       return error;
-//     }),
-//     checkNextNotificationTime().catch((error) => {
-//       // Catch any error that occurs so we do not stop the event notifications
-//       logger.error(
-//         "An error occurred in checkForPrescriptionNotifications",
-//         error
-//       );
-//       return error;
-//     }),
-//     processPrescriptionEvents().catch((error) => {
-//       // Catch any error that occurs so we do not stop the event notifications
-//       logger.error("An error occurred in processPrescriptionEvents", error);
-//       return error;
-//     }),
-//     processPrescriptionNextNotificationTime().catch((error) => {
-//       // Catch any error that occurs so we do not stop the event notifications
-//       logger.error(
-//         "An error occurred in processPrescriptionNextNotificationTime",
-//         error
-//       );
-//       return error;
-//     }),
-//   ]);
-// }
+export const checkNextNotificationTimeCron = onSchedule(
+  {
+    schedule: "*/1 * * * *",
+    timeZone: "America/New_York",
+    timeoutSeconds: 300,
+    memory: "512MiB",
+    region: "us-central1",
+  },
+  async () => {
+    const start = Date.now();
+    logger.log("🕒 checkNextNotificationTimeCron started");
 
-export async function checkForOutStandingNotifications(): Promise<void> {
-  const tasks = [
-    {
-      label: "checkEventDoses",
-      fn: checkEventDoses,
-    },
-    {
-      label: "checkNextNotificationTime",
-      fn: checkNextNotificationTime,
-    },
-    {
-      label: "processPrescriptionEvents",
-      fn: processPrescriptionEvents,
-    },
-    {
-      label: "processPrescriptionNextNotificationTime",
-      fn: processPrescriptionNextNotificationTime,
-    },
-  ];
-
-  const results = await Promise.allSettled(
-    tasks.map(async ({ label, fn }) => {
-      try {
-        const result = await fn();
-        logger.log(`✅ ${label} completed`);
-        return result;
-      } catch (err) {
-        logger.error(`❌ ${label} failed`, { error: err.message });
-        throw err; // optional: rethrow if you want failed count tracking
-      }
-    })
-  );
-
-  const failures = results.filter((res) => res.status === "rejected");
-  if (failures.length > 0) {
-    logger.warn(
-      `⚠️ ${failures.length} of ${tasks.length} notification sub-tasks failed.`
-    );
-  } else {
-    logger.log("✅ All notification sub-tasks completed successfully.");
+    try {
+      await checkNextNotificationTime();
+      logger.log(
+        `✅ checkNextNotificationTimeCron completed in ${Date.now() - start}ms`
+      );
+    } catch (err) {
+      logger.error("❌ checkNextNotificationTimeCron failed", err);
+    }
   }
-}
+);
+
+export const processPrescriptionEventsCron = onSchedule(
+  {
+    schedule: "*/1 * * * *",
+    timeZone: "America/New_York",
+    timeoutSeconds: 300,
+    memory: "512MiB",
+    region: "us-central1",
+  },
+  async () => {
+    const start = Date.now();
+    logger.log("🕒 processPrescriptionEvents started");
+
+    try {
+      await processPrescriptionEvents();
+      logger.log(
+        `✅ processPrescriptionEvents completed in ${Date.now() - start}ms`
+      );
+    } catch (err) {
+      logger.error("❌ processPrescriptionEvents failed", err);
+    }
+  }
+);
+
+// export const processPrescriptionNextNotificationTimeCron = onSchedule(
+//   {
+//     schedule: "*/1 * * * *",
+//     timeZone: "America/New_York",
+//     timeoutSeconds: 600,
+//     memory: "512MiB",
+//     region: "us-central1",
+//     maxInstances: 3,
+//     minInstances: 1, // 🔥 keep at least 1 instance warm, didnt fix problem
+//   },
+//   async () => {
+//     const start = Date.now();
+//     logger.log("🕒 processPrescriptionNextNotificationTime started");
+
+//     try {
+//       // race the real work against a 5-minute (300_000ms) hard cap
+//       await Promise.race([
+//         processPrescriptionNextNotificationTime(),
+//         new Promise<void>(
+//           (resolve) => setTimeout(resolve, 300_000) // 5 minutes
+//         ),
+//       ]);
+//       logger.log(
+//         `✅ processPrescriptionNextNotificationTime finished in ${
+//           Date.now() - start
+//         }ms`
+//       );
+//     } catch (err) {
+//       logger.error(
+//         "❌ processPrescriptionNextNotificationTime threw or timed out",
+//         err
+//       );
+//     }
+//   }
+// );
+
+export const processPrescriptionNextNotificationTimePubSub = onMessagePublished(
+  {
+    topic: "prescription-tick", // ← your Pub/Sub topic
+    region: "us-central1", // ← optional, defaults to us-central1
+    minInstances: 1, // ← keep one instance warm
+    timeoutSeconds: 540, // ← up to 9m for event handlers
+    memory: "512MiB", // ← if you need more RAM/CPU
+  },
+  async (event) => {
+    console.log("🔔 Pub/Sub tick received at", new Date().toISOString());
+    const start = Date.now();
+    logger.log("🕒 processPrescriptionNextNotificationTime started");
+    try {
+      await processPrescriptionNextNotificationTime();
+      logger.log(
+        `✅ processPrescriptionNextNotificationTime finished in ${
+          Date.now() - start
+        }ms`
+      );
+    } catch (err) {
+      logger.error(
+        "❌ processPrescriptionNextNotificationTime threw or timed out",
+        err
+      );
+    }
+    console.log("✅ Done processing");
+  }
+);
 
 export const checkEventDoses = async () => {
   const currentTime = Date.now();
@@ -681,11 +698,174 @@ export const processPrescriptionEvents = async () => {
   return null;
 };
 
+// export const processPrescriptionNextNotificationTime = async () => {
+//   const currentTime = Date.now();
+//   const startOfMinute = getStartOfMinute(currentTime);
+//   const endOfMinute = getEndOfMinute(currentTime);
+
+//   const snapshot = await db
+//     .ref("prescription_events")
+//     .orderByChild("nextNotificationTime")
+//     .startAt(startOfMinute)
+//     .endAt(endOfMinute)
+//     .once("value");
+
+//   logger.log(`🧮 Matched ${snapshot.size} prescription events`);
+
+//   const promises: Promise<any>[] = [];
+
+//   snapshot.forEach((childSnapshot) => {
+//     const event = childSnapshot.val();
+//     const eventId = childSnapshot.key;
+//     if (
+//       event.state === "active" &&
+//       event.nextNotificationTime &&
+//       event.notificationCount <= 5
+//     ) {
+//       const promise = (async () => {
+//         // Local variables for this event's processing.
+//         let child: any;
+//         let parent: any;
+//         let prescription: any;
+//         let notificationBody = "";
+
+//         // 1) Get the child data
+//         try {
+//           child = await getChild(event.childId);
+//           if (!child) {
+//             throw new Error(`Child not found for ID ${event.childId}`);
+//           }
+//         } catch (err) {
+//           logger.error(`Error fetching child for event ${eventId}:`, err);
+//         }
+
+//         // 2) Get the parent data
+//         try {
+//           if (child) {
+//             parent = await getUser(child.parentId);
+//             if (!parent) {
+//               throw new Error(`Parent not found for ID ${child.parentId}`);
+//             }
+//           }
+//         } catch (err) {
+//           logger.error(`Error fetching parent for event ${eventId}:`, err);
+//         }
+
+//         // 3) Get prescription details
+//         try {
+//           prescription = await getPrescription(event.prescriptionId);
+//         } catch (err) {
+//           logger.error(
+//             `Error fetching prescription for event ${eventId}:`,
+//             err
+//           );
+//         }
+
+//         // 4) Prepare notification message (if we have child and prescription data)
+//         if (child && prescription) {
+//           notificationBody = prescriptionNotification(
+//             child.childName,
+//             event.notificationCount,
+//             prescription.name
+//           );
+//         }
+
+//         // 5) Send notification to parent if allowed
+//         try {
+//           if (parent && parent.allowsPushNotifications && notificationBody) {
+//             await sendPushNotificationsToUser(parent.uid, notificationBody, {
+//               childId: event.childId,
+//               eventId: eventId,
+//               screen: "PrimarySchedule",
+//             });
+//           }
+//         } catch (err) {
+//           logger.error(
+//             `Error sending notification to parent ${
+//               parent ? parent.uid : "unknown"
+//             }, for event: ${eventId ? eventId : "unknown"}, for child: ${
+//               event.childId ? event.childId : "unknown"
+//             }`,
+//             err
+//           );
+//         }
+
+//         // 6) Send notifications to eligible care team members
+//         try {
+//           if (child) {
+//             const careFamilyMembers = await fetchCareFamilyMembers(
+//               child.parentId,
+//               event.childId
+//             );
+//             const eligibleMembers = careFamilyMembers.filter(
+//               (member) => member.allowsPushNotifications
+//             );
+//             const memberResults = await Promise.allSettled(
+//               eligibleMembers.map((member) =>
+//                 sendPushNotificationsToUser(member.uid, notificationBody, {
+//                   childId: event.childId,
+//                   eventId: eventId,
+//                   screen: "PrimarySchedule",
+//                 })
+//               )
+//             );
+//             memberResults.forEach((result) => {
+//               if (result.status === "rejected") {
+//                 logger.error(
+//                   `Error sending notification to a care team member:`,
+//                   result.reason
+//                 );
+//               }
+//             });
+//           }
+//         } catch (err) {
+//           logger.error(
+//             `Error processing care team notifications for event ${eventId}`,
+//             err
+//           );
+//         }
+
+//         // Always call updatePrescriptionEventNotificationCount.
+//         // This ensures that even if some notifications fail, the event update is attempted.
+//         try {
+//           // Use parent's timeZone if available, otherwise default to "UTC"
+//           const effectiveTimeZone =
+//             parent && parent.timeZone ? parent.timeZone : "UTC";
+//           await updatePrescriptionEventNotificationCount(
+//             event,
+//             eventId,
+//             currentTime,
+//             prescription,
+//             effectiveTimeZone
+//           );
+//         } catch (updateError) {
+//           logger.error(
+//             `Error updating prescription event for child ${event.childId}:`,
+//             updateError,
+//             eventId
+//           );
+//         }
+//       })();
+//       promises.push(promise);
+//     }
+//   });
+
+//   await Promise.all(promises);
+//   return null;
+// };
+
 export const processPrescriptionNextNotificationTime = async () => {
+  const { default: pLimit } = await import("p-limit");
+  const limit = pLimit(10);
+  const careTeamLimit = pLimit(5);
+
   const currentTime = Date.now();
   const startOfMinute = getStartOfMinute(currentTime);
   const endOfMinute = getEndOfMinute(currentTime);
 
+  logger.log(
+    `🔍 Fetching prescription_events from ${startOfMinute} to ${endOfMinute}`
+  );
   const snapshot = await db
     .ref("prescription_events")
     .orderByChild("nextNotificationTime")
@@ -693,145 +873,156 @@ export const processPrescriptionNextNotificationTime = async () => {
     .endAt(endOfMinute)
     .once("value");
 
+  const childCache = new Map();
+  const parentCache = new Map();
   const promises: Promise<any>[] = [];
+
+  logger.log(`🧮 Matched ${snapshot.numChildren()} prescription events`);
 
   snapshot.forEach((childSnapshot) => {
     const event = childSnapshot.val();
     const eventId = childSnapshot.key;
+
     if (
       event.state === "active" &&
       event.nextNotificationTime &&
       event.notificationCount <= 5
     ) {
-      const promise = (async () => {
-        // Local variables for this event's processing.
-        let child: any;
-        let parent: any;
-        let prescription: any;
-        let notificationBody = "";
+      promises.push(
+        limit(async () => {
+          const childStart = Date.now();
 
-        // 1) Get the child data
-        try {
-          child = await getChild(event.childId);
-          if (!child) {
-            throw new Error(`Child not found for ID ${event.childId}`);
-          }
-        } catch (err) {
-          logger.error(`Error fetching child for event ${eventId}:`, err);
-        }
+          let child: any = null;
+          let parent: any = null;
+          let prescription: any = null;
+          let notificationBody = "";
 
-        // 2) Get the parent data
-        try {
-          if (child) {
-            parent = await getUser(child.parentId);
-            if (!parent) {
-              throw new Error(`Parent not found for ID ${child.parentId}`);
+          try {
+            if (!childCache.has(event.childId)) {
+              logger.log(`🔍 Fetching child ${event.childId}`);
+              child = await getChild(event.childId);
+              logger.log(`✅ Fetched child ${child?.id || "none"}`);
+              childCache.set(event.childId, child);
+            } else {
+              child = childCache.get(event.childId);
             }
+
+            if (!child)
+              throw new Error(`Child not found for ID ${event.childId}`);
+          } catch (err) {
+            logger.error(`Error fetching child for event ${eventId}:`, err);
           }
-        } catch (err) {
-          logger.error(`Error fetching parent for event ${eventId}:`, err);
-        }
 
-        // 3) Get prescription details
-        try {
-          prescription = await getPrescription(event.prescriptionId);
-        } catch (err) {
-          logger.error(
-            `Error fetching prescription for event ${eventId}:`,
-            err
-          );
-        }
-
-        // 4) Prepare notification message (if we have child and prescription data)
-        if (child && prescription) {
-          notificationBody = prescriptionNotification(
-            child.childName,
-            event.notificationCount,
-            prescription.name
-          );
-        }
-
-        // 5) Send notification to parent if allowed
-        try {
-          if (parent && parent.allowsPushNotifications && notificationBody) {
-            await sendPushNotificationsToUser(parent.uid, notificationBody, {
-              childId: event.childId,
-              eventId: eventId,
-              screen: "PrimarySchedule",
-            });
-          }
-        } catch (err) {
-          logger.error(
-            `Error sending notification to parent ${
-              parent ? parent.uid : "unknown"
-            }, for event: ${eventId ? eventId : "unknown"}, for child: ${
-              event.childId ? event.childId : "unknown"
-            }`,
-            err
-          );
-        }
-
-        // 6) Send notifications to eligible care team members
-        try {
-          if (child) {
-            const careFamilyMembers = await fetchCareFamilyMembers(
-              child.parentId,
-              event.childId
-            );
-            const eligibleMembers = careFamilyMembers.filter(
-              (member) => member.allowsPushNotifications
-            );
-            const memberResults = await Promise.allSettled(
-              eligibleMembers.map((member) =>
-                sendPushNotificationsToUser(member.uid, notificationBody, {
-                  childId: event.childId,
-                  eventId: eventId,
-                  screen: "PrimarySchedule",
-                })
-              )
-            );
-            memberResults.forEach((result) => {
-              if (result.status === "rejected") {
-                logger.error(
-                  `Error sending notification to a care team member:`,
-                  result.reason
-                );
+          try {
+            if (child) {
+              if (!parentCache.has(child.parentId)) {
+                logger.log(`🔍 Fetching parent ${child?.parentId}`);
+                parent = await getUser(child.parentId);
+                logger.log(`✅ Fetched parent ${parent?.id || "none"}`);
+                parentCache.set(child.parentId, parent);
+              } else {
+                parent = parentCache.get(child.parentId);
               }
-            });
-          }
-        } catch (err) {
-          logger.error(
-            `Error processing care team notifications for event ${eventId}`,
-            err
-          );
-        }
 
-        // Always call updatePrescriptionEventNotificationCount.
-        // This ensures that even if some notifications fail, the event update is attempted.
-        try {
-          // Use parent's timeZone if available, otherwise default to "UTC"
-          const effectiveTimeZone =
-            parent && parent.timeZone ? parent.timeZone : "UTC";
-          await updatePrescriptionEventNotificationCount(
-            event,
-            eventId,
-            currentTime,
-            prescription,
-            effectiveTimeZone
+              if (!parent)
+                throw new Error(`Parent not found for ID ${child.parentId}`);
+            }
+          } catch (err) {
+            logger.error(`Error fetching parent for event ${eventId}:`, err);
+          }
+
+          try {
+            logger.log(`🔍 Fetching prescription ${event.prescriptionId}`);
+            prescription = await getPrescription(event.prescriptionId);
+            logger.log(
+              `✅ Fetched prescription ${prescription?.name || "none"}`
+            );
+          } catch (err) {
+            logger.error(
+              `Error fetching prescription for event ${eventId}:`,
+              err
+            );
+          }
+
+          if (child && prescription) {
+            notificationBody = prescriptionNotification(
+              child.childName,
+              event.notificationCount,
+              prescription.name
+            );
+          }
+
+          const pushTasks: Promise<any>[] = [];
+
+          if (parent?.allowsPushNotifications && notificationBody) {
+            pushTasks.push(
+              sendPushNotificationsToUser(parent.uid, notificationBody, {
+                childId: event.childId,
+                eventId,
+                screen: "PrimarySchedule",
+              })
+            );
+          }
+
+          try {
+            if (child) {
+              const careFamilyMembers = await fetchCareFamilyMembers(
+                child.parentId,
+                event.childId
+              );
+              const eligible = careFamilyMembers.filter(
+                (m) => m.allowsPushNotifications
+              );
+
+              pushTasks.push(
+                ...eligible.map((member) =>
+                  careTeamLimit(() =>
+                    sendPushNotificationsToUser(member.uid, notificationBody, {
+                      childId: event.childId,
+                      eventId,
+                      screen: "PrimarySchedule",
+                    })
+                  )
+                )
+              );
+            }
+          } catch (err) {
+            logger.error(
+              `Error processing care team for event ${eventId}`,
+              err
+            );
+          }
+
+          await Promise.allSettled(pushTasks);
+
+          try {
+            const timeZone = parent?.timeZone ?? "UTC";
+            await updatePrescriptionEventNotificationCount(
+              event,
+              eventId,
+              currentTime,
+              prescription,
+              timeZone
+            );
+          } catch (error) {
+            logger.error(`❌ Task failed for event ${eventId}`, error);
+          }
+
+          logger.log(
+            `✅ Event ${eventId} completed in ${Date.now() - childStart}ms`
           );
-        } catch (updateError) {
-          logger.error(
-            `Error updating prescription event for child ${event.childId}:`,
-            updateError,
-            eventId
-          );
-        }
-      })();
-      promises.push(promise);
+        })
+      );
     }
   });
 
-  await Promise.all(promises);
+  await Promise.allSettled(promises);
+
+  logger.log(
+    "✅ ALL DONE – processPrescriptionNextNotificationTime is returning now"
+  );
+
+  setTimeout(() => {}, 0); // Ensure Node loop flushes and prevents hang
   return null;
 };
 
@@ -972,11 +1163,16 @@ export async function updatePrescriptionEventNotificationCount(
     await newDoseRef.set(dose);
 
     const timeStamp = calculateNextDose(prescription, timeZone);
-    logger.log("timeStamp", timeStamp);
+    logger.log(
+      "timeStamp in updatePrescriptionEventNotificationCount",
+      timeStamp
+    );
     updates.nextScheduledDose = timeStamp;
   }
 
+  logger.log(`💾 Updating event ${eventId} with new notificationCount`);
   await db.ref(`prescription_events/${eventId}`).update(updates);
+  logger.log(`✅ Event ${eventId} updated`);
 }
 
 const fetchCareFamilyMembers = async (parentId: string, childID: string) => {
@@ -1219,7 +1415,7 @@ const removeAllCaregiversForUser = async (userId) => {
 export function calculateNextDose(prescription: any, timeZone: string): number {
   const { frequency, startDate, reminderTimes } = prescription || {};
   const currentTime = moment.tz(timeZone).valueOf();
-  logger.log("currentTime", currentTime, prescription);
+  logger.log("calculateNextDose currentTime", currentTime, prescription);
 
   // Ensure nextDose is at least `startDate` and after the current time
   let nextDose = Math.max(
@@ -2258,25 +2454,38 @@ async function validateGoogleReceipt(purchaseToken, packageName, productId) {
 
 // ****************************************************** Start Data Migration ********************************
 
-exports.convertOnCureUser = v1
-  .runWith({ timeoutSeconds: 240 })
-  .https.onCall(async (data, context) => {
+export const convertOnCureUser = onCall(
+  {
+    timeoutSeconds: 240,
+    secrets: [ONCURE_SERVICE_ACCOUNT_JSON],
+  },
+  async (request: CallableRequest<any>) => {
+    const data = request.data;
+
     const { appVersion, timeZone } = data;
-    if (!context.auth) {
-      throw new v1.https.HttpsError(
-        "unauthenticated",
-        "Function must be called while authenticated."
-      );
+
+    if (!request.auth) {
+      throw new Error("Function must be called while authenticated.");
     }
 
-    const userId = context.auth.uid;
+    const userId = request.auth.uid;
     logger.log("userId", userId);
+
+    // Guard: ensure onCureApp is initialized
+    const onCureDb = admin.apps.some((app) => app.name === "onCureApp")
+      ? admin.app("onCureApp").database()
+      : null;
+
+    if (!onCureDb) {
+      logger.error("onCureApp is not initialized. Aborting convertOnCureUser.");
+      throw new Error("Legacy user migration is not available.");
+    }
 
     try {
       // 1) Fetch old user
       const userSnap = await onCureDb.ref(`/users/${userId}`).once("value");
       if (!userSnap.exists()) {
-        throw new v1.https.HttpsError("not-found", `User ${userId} not found`);
+        throw new Error(`User ${userId} not found`);
       }
       const oldUserData = userSnap.val();
 
@@ -2294,7 +2503,7 @@ exports.convertOnCureUser = v1
       const childIds = Object.keys(childrenData);
 
       // 3) Transform user
-      const email = context.auth.token.email;
+      const email = request.auth.token.email;
       const newUser = transformOnCureUser(
         oldUserData,
         userId,
@@ -2341,12 +2550,9 @@ exports.convertOnCureUser = v1
         user: newUser,
         childrenCount: childIds.length,
       };
-    } catch (error) {
-      console.error("Error in convertOnCureUser:", error);
-      throw new v1.https.HttpsError(
-        "internal",
-        (error as Error)?.message || "Unknown error."
-      );
+    } catch (error: any) {
+      logger.error("Error in convertOnCureUser:", error);
+      throw new Error(error?.message || "Unknown error.");
     } finally {
       // Final step: update onCureDb to set allowsPushNotifications to false.
       try {
@@ -2361,10 +2567,11 @@ exports.convertOnCureUser = v1
           `Error updating onCureDb allowsPushNotifications for user ${userId}:`,
           err
         );
-        // Do not rethrow so that this step does not stop the overall function.
+        // Don't rethrow
       }
     }
-  });
+  }
+);
 
 //************* User data ******************/
 
