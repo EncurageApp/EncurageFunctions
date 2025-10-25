@@ -243,6 +243,7 @@ export const processPrescriptionNextNotificationCron = onSchedule(
       instance: process.env.K_INSTANCE,
       node: process.version,
     });
+    logger.log("🕑 start:", new Date(start).toISOString());
 
     // ✅ 2. Quick proof that the event loop is alive
     setTimeout(() => logger.log("⏱️ cron:loop-alive-after-1s"), 1000);
@@ -716,6 +717,7 @@ export const processPrescriptionNextNotificationTime = async () => {
   const minuteStart = getStartOfMinute(now);
   const minuteEnd = getEndOfMinute(now);
   logger.log("🕑 now:", new Date(now).toISOString());
+  logger.log("🕑 now:", new Date(now).toISOString());
 
   const snap = await db
     .ref("prescription_events")
@@ -730,586 +732,214 @@ export const processPrescriptionNextNotificationTime = async () => {
   if (totalEvents === 0) return;
 
   // 2) collect events into array
+  // snap.forEach((childSnapshot) => {
+  //   const event = childSnapshot.val();
+  //   const eventId = childSnapshot.key;
+
+  //   if (
+  //     event.state === "active" &&
+  //     event.nextNotificationTime &&
+  //     event.notificationCount <= 5
+  //   ) {
+  //     const promise = (async () => {
+  //       let child: any;
+  //       let parent: any;
+  //       let notificationBody = "";
+
+  //       // 1) Get child data
+  //       try {
+  //         child = await getChild(event.childId);
+  //         if (!child) {
+  //           throw new Error(`Child not found for ID ${event.childId}`);
+  //         }
+  //       } catch (error) {
+  //         logger.error(`Error fetching child for event ${eventId}:`, error);
+  //       }
+
+  //       // 2) Get parent data
+  //       try {
+  //         if (child) {
+  //           parent = await getUser(child.parentId);
+  //           if (!parent) {
+  //             throw new Error(`Parent not found for ID ${child.parentId}`);
+  //           }
+  //         }
+  //       } catch (error) {
+  //         logger.error(`Error fetching parent for event ${eventId}:`, error);
+  //       }
+
+  //       // 3) fetch prescription
+  //       const prescription = await getPrescription(event.prescriptionId);
+  //       if (!prescription)
+  //         throw new Error(`Prescription not found: ${event.prescriptionId}`);
+
+  //       // 4) build notifications
+  //       notificationBody = prescriptionNotification(
+  //         child.childName,
+  //         event.notificationCount,
+  //         prescription.name
+  //       );
+
+  //       // 4) Send notification to parent if allowed
+  //       try {
+  //         if (parent && parent.allowsPushNotifications && notificationBody) {
+  //           await sendPushNotificationsToUser(parent.uid, notificationBody, {
+  //             childId: event.childId,
+  //             eventId: eventId,
+  //             screen: "PrimarySchedule",
+  //           });
+  //         }
+  //       } catch (error) {
+  //         logger.error(
+  //           `Error sending notification to parent ${
+  //             parent ? parent.uid : "unknown"
+  //           } for event ${eventId}:`,
+  //           error
+  //         );
+  //       }
+
+  //       // 5) Send notifications to eligible care team members
+  //       try {
+  //         if (child) {
+  //           const careFamilyMembers = await fetchCareFamilyMembers(
+  //             child.parentId,
+  //             event.childId
+  //           );
+  //           const eligibleMembers = careFamilyMembers.filter(
+  //             (member) => member.allowsPushNotifications
+  //           );
+  //           const memberResults = await Promise.allSettled(
+  //             eligibleMembers.map((member) =>
+  //               sendPushNotificationsToUser(member.uid, notificationBody, {
+  //                 childId: event.childId,
+  //                 eventId: eventId,
+  //                 screen: "PrimarySchedule",
+  //               })
+  //             )
+  //           );
+  //           memberResults.forEach((result) => {
+  //             if (result.status === "rejected") {
+  //               logger.error(
+  //                 `Error sending notification to care team member for event ${eventId}:`,
+  //                 result.reason
+  //               );
+  //             }
+  //           });
+  //         }
+  //       } catch (error) {
+  //         logger.error(
+  //           `Error processing care team notifications for event ${eventId}:`,
+  //           error
+  //         );
+  //       }
+
+  //       // 6) update DB
+  //       try {
+  //         return await updatePrescriptionEventNotificationCount(
+  //           event,
+  //           eventId,
+  //           now,
+  //           prescription,
+  //           parent.timeZone ?? "UTC"
+  //         );
+  //       } catch (updateError) {
+  //         logger.error(
+  //           `Error updating event ${eventId} in processPrescriptionNextNotificationTime:`,
+  //           updateError
+  //         );
+  //       }
+
+  //       logger.log(`✅ Updated event ${eventId}`);
+  //     })();
+  //     promises.push(promise);
+  //   }
+  // });
+
   snap.forEach((childSnapshot) => {
     const event = childSnapshot.val();
     const eventId = childSnapshot.key;
 
+    // skip unqualified events
     if (
-      event.state === "active" &&
-      event.nextNotificationTime &&
-      event.notificationCount <= 5
+      event.state !== "active" ||
+      !event.nextNotificationTime ||
+      event.notificationCount > 5
     ) {
-      const promise = (async () => {
-        let child: any;
-        let parent: any;
-        let notificationBody = "";
+      return;
+    }
 
-        // 1) Get child data
+    promises.push(
+      (async () => {
         try {
-          child = await getChild(event.childId);
-          if (!child) {
+          const child = await getChild(event.childId);
+          if (!child)
             throw new Error(`Child not found for ID ${event.childId}`);
-          }
-        } catch (error) {
-          logger.error(`Error fetching child for event ${eventId}:`, error);
-        }
 
-        // 2) Get parent data
-        try {
-          if (child) {
-            parent = await getUser(child.parentId);
-            if (!parent) {
-              throw new Error(`Parent not found for ID ${child.parentId}`);
-            }
-          }
-        } catch (error) {
-          logger.error(`Error fetching parent for event ${eventId}:`, error);
-        }
+          const parent = await getUser(child.parentId);
+          if (!parent)
+            throw new Error(`Parent not found for ID ${child.parentId}`);
 
-        // 3) fetch prescription
-        const prescription = await getPrescription(event.prescriptionId);
-        if (!prescription)
-          throw new Error(`Prescription not found: ${event.prescriptionId}`);
+          const prescription = await getPrescription(event.prescriptionId);
+          if (!prescription)
+            throw new Error(`Prescription not found: ${event.prescriptionId}`);
 
-        // 4) build notifications
-        notificationBody = prescriptionNotification(
-          child.childName,
-          event.notificationCount,
-          prescription.name
-        );
+          const body = prescriptionNotification(
+            child.childName,
+            event.notificationCount,
+            prescription.name
+          );
 
-        // 4) Send notification to parent if allowed
-        try {
-          if (parent && parent.allowsPushNotifications && notificationBody) {
-            await sendPushNotificationsToUser(parent.uid, notificationBody, {
+          if (parent.allowsPushNotifications) {
+            await sendPushNotificationsToUser(parent.uid, body, {
               childId: event.childId,
-              eventId: eventId,
+              eventId,
               screen: "PrimarySchedule",
             });
           }
-        } catch (error) {
-          logger.error(
-            `Error sending notification to parent ${
-              parent ? parent.uid : "unknown"
-            } for event ${eventId}:`,
-            error
-          );
-        }
 
-        // 5) Send notifications to eligible care team members
-        try {
-          if (child) {
-            const careFamilyMembers = await fetchCareFamilyMembers(
-              child.parentId,
-              event.childId
-            );
-            const eligibleMembers = careFamilyMembers.filter(
-              (member) => member.allowsPushNotifications
-            );
-            const memberResults = await Promise.allSettled(
-              eligibleMembers.map((member) =>
-                sendPushNotificationsToUser(member.uid, notificationBody, {
+          const careFamilyMembers = await fetchCareFamilyMembers(
+            child.parentId,
+            event.childId
+          );
+          await Promise.allSettled(
+            careFamilyMembers
+              .filter((m) => m.allowsPushNotifications)
+              .map((m) =>
+                sendPushNotificationsToUser(m.uid, body, {
                   childId: event.childId,
-                  eventId: eventId,
+                  eventId,
                   screen: "PrimarySchedule",
                 })
               )
-            );
-            memberResults.forEach((result) => {
-              if (result.status === "rejected") {
-                logger.error(
-                  `Error sending notification to care team member for event ${eventId}:`,
-                  result.reason
-                );
-              }
-            });
-          }
-        } catch (error) {
-          logger.error(
-            `Error processing care team notifications for event ${eventId}:`,
-            error
           );
-        }
 
-        // 6) update DB
-        try {
-          return await updatePrescriptionEventNotificationCount(
+          await updatePrescriptionEventNotificationCount(
             event,
             eventId,
             now,
             prescription,
             parent.timeZone ?? "UTC"
           );
-        } catch (updateError) {
-          logger.error(
-            `Error updating event ${eventId} in processPrescriptionNextNotificationTime:`,
-            updateError
-          );
+
+          logger.log(`✅ Updated event ${eventId}`);
+        } catch (err) {
+          logger.error(`❌ Failed event ${eventId}`, err);
         }
-
-        logger.log(`✅ Updated event ${eventId}`);
-      })();
-      promises.push(promise);
-    }
+      })()
+    );
   });
-  await Promise.all(promises);
-  return null;
+
+  if (promises.length === 0) {
+    logger.log("No active events found this minute");
+    return null;
+  }
+
+  await Promise.allSettled(promises);
+  // logger.log(`✅ Completed ${promises.length} events`);
+
+  // await Promise.all(promises);
+  // return null;
 };
-
-// export const processPrescriptionNextNotificationTime = async () => {
-//   const { default: pLimit } = await import("p-limit");
-
-//   const now = Date.now();
-//   const minuteStart = getStartOfMinute(now);
-//   const minuteEnd = getEndOfMinute(now);
-
-//   logger.log("🕑 now:", new Date(now).toISOString());
-//   logger.log("🟢 minuteStart (−fudge):", new Date(minuteStart).toISOString());
-
-//   // 1) fetch events in minute window
-//   const t0 = Date.now();
-//   const snap = await db
-//     .ref("prescription_events")
-//     .orderByChild("nextNotificationTime")
-//     .startAt(minuteStart)
-//     .endAt(minuteEnd)
-//     .once("value");
-
-//   const totalEvents = snap.numChildren();
-//   logger.log(`🧮 Found ${totalEvents} events in time window`);
-//   if (totalEvents === 0) return;
-
-//   // 2) collect events into array
-//   const t1 = Date.now();
-//   type EventWithId = { id: string; data: any };
-//   const events: EventWithId[] = [];
-//   snap.forEach((childSnap) => {
-//     events.push({ id: childSnap.key!, data: childSnap.val() });
-//   });
-//   const t2 = Date.now();
-//   // // 4) bulk-fetch children
-//   // const childIds = Array.from(new Set(events.map((e) => e.data.childId)));
-//   // const children = await Promise.all(childIds.map((id) => getChild(id)));
-//   // const childCache = new Map(children.filter(Boolean).map((c) => [c.id, c]));
-
-//   // // 5) bulk-fetch parents
-//   // const parentIds = Array.from(
-//   //   new Set(children.filter(Boolean).map((c) => c.parentId))
-//   // );
-//   // const parents = await Promise.all(parentIds.map((id) => getUser(id)));
-//   // const parentCache = new Map(parents.filter(Boolean).map((p) => [p.id, p]));
-
-//   const childCache = new Map<string, any>();
-//   const parentCache = new Map<string, any>();
-//   const careTeamCache = new Map<string, any[]>();
-
-//   async function getChildCached(childId: string) {
-//     if (!childCache.has(childId)) {
-//       const child = await getChild(childId);
-//       if (!child) throw new Error(`Child not found: ${childId}`);
-//       childCache.set(childId, child);
-//     }
-//     return childCache.get(childId)!;
-//   }
-
-//   async function getParentCached(parentId: string) {
-//     if (!parentCache.has(parentId)) {
-//       const parent = await getUser(parentId);
-//       if (!parent) throw new Error(`Parent not found: ${parentId}`);
-//       parentCache.set(parentId, parent);
-//     }
-//     return parentCache.get(parentId)!;
-//   }
-
-//   async function getCareTeamCached(parentId: string, childId: string) {
-//     const key = `${parentId}:${childId}`;
-//     if (!careTeamCache.has(key)) {
-//       const members = await fetchCareFamilyMembers(parentId, childId);
-//       careTeamCache.set(key, members || []);
-//     }
-//     return careTeamCache.get(key)!;
-//   }
-
-//   // 6) prepare concurrency limits
-//   const updateLimit = pLimit(5);
-//   const careTeamLimit = pLimit(3);
-
-//   // 7) build per-event tasks
-//   const tasks = events.map(({ id: eventId, data: event }) =>
-//     updateLimit(async () => {
-//       // a) skip filters
-//       if (
-//         event.state !== "active" ||
-//         !event.nextNotificationTime ||
-//         event.notificationCount > 5
-//       ) {
-//         logger.log(
-//           `⏩ Skipping ${eventId}:`,
-//           `state=${event.state}`,
-//           `nextNotificationTime=${event.nextNotificationTime}`,
-//           `notificationCount=${event.notificationCount}`
-//         );
-//         return;
-//       }
-
-//       // b) lookup in caches
-//       // const child = childCache.get(event.childId);
-//       // if (!child) throw new Error(`Child not found in cache: ${event.childId}`);
-
-//       // const parent = parentCache.get(child.parentId);
-//       // if (!parent)
-//       //   throw new Error(`Parent not found in cache: ${child.parentId}`);
-
-//       const child = await getChildCached(event.childId);
-//       const parent = await getParentCached(child.parentId);
-
-//       // c) fetch prescription
-//       const prescription = await getPrescription(event.prescriptionId);
-//       if (!prescription)
-//         throw new Error(`Prescription not found: ${event.prescriptionId}`);
-
-//       // d) build & send notifications
-//       const body = prescriptionNotification(
-//         child.childName,
-//         event.notificationCount,
-//         prescription.name
-//       );
-
-//       // parent
-//       const parentPromises: Promise<any>[] = [];
-//       if (parent.allowsPushNotifications) {
-//         parentPromises.push(
-//           sendPushNotificationsToUser(parent.uid, body, {
-//             childId: event.childId,
-//             eventId,
-//             screen: "PrimarySchedule",
-//           })
-//         );
-//       }
-
-//       // care team
-//       // const careMembers = await fetchCareFamilyMembers(
-//       //   child.parentId,
-//       //   event.childId
-//       // );
-
-//       const careMembers = await getCareTeamCached(
-//         child.parentId,
-//         event.childId
-//       );
-//       const careTeamPromises = careMembers
-//         .filter((m) => m.allowsPushNotifications)
-//         .map((m) =>
-//           careTeamLimit(() =>
-//             sendPushNotificationsToUser(m.uid, body, {
-//               childId: event.childId,
-//               eventId,
-//               screen: "PrimarySchedule",
-//             })
-//           )
-//         );
-
-//       // ✅ wait for *all* sends (parent + care team) to settle
-//       await Promise.allSettled([...parentPromises, ...careTeamPromises]);
-
-//       // e) update DB (fail-fast on error)
-//       await updatePrescriptionEventNotificationCount(
-//         event,
-//         eventId,
-//         now,
-//         prescription,
-//         parent.timeZone ?? "UTC"
-//       );
-//       logger.log(`✅ Updated event ${eventId}`);
-//     })
-//   );
-
-//   // 8) run all tasks, but don't fail the entire tick if one rejects
-//   const results = await Promise.allSettled(tasks);
-//   const t3 = Date.now();
-
-//   logger.log(
-//     `⏱️ timings(ms) snap=${t1 - t0} map=${t2 - t1} tasks=${t3 - t2} total=${
-//       t3 - t0
-//     }`
-//   );
-//   logger.log(`📊 counts events=${events.length}`);
-
-//   const failed = results.filter(
-//     (r) => r.status === "rejected"
-//   ) as PromiseRejectedResult[];
-//   if (failed.length > 0) {
-//     logger.error(`❌ ${failed.length} event(s) failed this minute`);
-//     failed.forEach((f, i) => {
-//       logger.error(`  └─ Failure #${i + 1}:`, f.reason);
-//     });
-//   } else {
-//     logger.log("✅ All events processed successfully");
-//   }
-// };
-
-// export const processPrescriptionNextNotificationTime = async () => {
-//   // ————————————————————————————————————————————————————————————————————————
-//   // Tunables (override via env without redeploy)
-//   // ————————————————————————————————————————————————————————————————————————
-//   const DRY_RUN =
-//     (process.env.PRESCRIPTION_CRON_DRY_RUN || "false").toLowerCase() === "true";
-//   const MAX_EVENTS_PER_TICK = Number(process.env.MAX_EVENTS_PER_TICK || 200); // hard cap
-//   const CHILD_TIMEOUT_MS = Number(process.env.CHILD_TIMEOUT_MS || 15_000);
-//   const PARENT_TIMEOUT_MS = Number(process.env.PARENT_TIMEOUT_MS || 15_000);
-//   const RX_TIMEOUT_MS = Number(process.env.RX_TIMEOUT_MS || 15_000);
-//   const SEND_TIMEOUT_MS = Number(process.env.SEND_TIMEOUT_MS || 15_000);
-//   const UPDATE_TIMEOUT_MS = Number(process.env.UPDATE_TIMEOUT_MS || 15_000);
-
-//   // Concurrency: keep small to flatten memory/IO spikes
-//   const { default: pLimit } = await import("p-limit");
-//   const updateLimit = pLimit(Number(process.env.UPDATE_LIMIT || 5)); // per-event workers
-//   const careTeamLimit = pLimit(Number(process.env.CARE_LIMIT || 3)); // per-event care fan-out
-
-//   // ————————————————————————————————————————————————————————————————————————
-//   // Time window
-//   // ————————————————————————————————————————————————————————————————————————
-//   const now = Date.now();
-//   const minuteStart = getStartOfMinute(now);
-//   const minuteEnd = getEndOfMinute(now);
-
-//   logger.log("🕑 now:", new Date(now).toISOString());
-//   logger.log("🟢 minuteStart:", new Date(minuteStart).toISOString());
-
-//   // ————————————————————————————————————————————————————————————————————————
-//   // Query window (must be indexed on 'nextNotificationTime')
-//   // ————————————————————————————————————————————————————————————————————————
-//   const t0 = Date.now();
-//   const snap = await db
-//     .ref("prescription_events")
-//     .orderByChild("nextNotificationTime")
-//     .startAt(minuteStart)
-//     .endAt(minuteEnd)
-//     .once("value");
-
-//   const totalEvents = snap.numChildren();
-//   logger.log(`🧮 Found ${totalEvents} events in time window`);
-//   if (totalEvents === 0) return;
-
-//   // ————————————————————————————————————————————————————————————————————————
-//   // Collect up to MAX_EVENTS_PER_TICK only (cap prevents OOM spikes)
-//   // ————————————————————————————————————————————————————————————————————————
-//   type EventWithId = { id: string; data: any };
-//   const t1 = Date.now();
-//   const batch: EventWithId[] = [];
-//   snap.forEach((childSnap) => {
-//     if (batch.length < MAX_EVENTS_PER_TICK) {
-//       batch.push({ id: childSnap.key!, data: childSnap.val() });
-//     }
-//     // RTDB forEach can't break; we just ignore overflow after cap.
-//     return false; // keep iterating
-//   });
-//   if (totalEvents > MAX_EVENTS_PER_TICK) {
-//     logger.warn(`⚠️ Capping events: ${totalEvents} → ${MAX_EVENTS_PER_TICK}`);
-//   }
-//   const t2 = Date.now();
-
-//   // ————————————————————————————————————————————————————————————————————————
-//   // Lightweight, per-run memo caches (avoid bulk prefetch)
-//   // ————————————————————————————————————————————————————————————————————————
-//   const childCache = new Map<string, any>(); // store only what you really need
-//   const parentCache = new Map<string, any>();
-//   const careTeamCache = new Map<
-//     string,
-//     Array<{ uid: string; allowsPushNotifications?: boolean }>
-//   >();
-
-//   // Small helper to add timeouts to any promise
-//   function withTimeout<T>(p: Promise<T>, ms: number, tag: string): Promise<T> {
-//     let to: NodeJS.Timeout;
-//     return Promise.race<T>([
-//       p,
-//       new Promise<T>(
-//         (_, rej) =>
-//           (to = setTimeout(() => rej(new Error(`timeout:${tag}:${ms}ms`)), ms))
-//       ),
-//     ]).finally(() => clearTimeout(to!));
-//   }
-
-//   async function getChildCached(childId: string) {
-//     if (!childCache.has(childId)) {
-//       const child = await withTimeout(
-//         getChild(childId),
-//         CHILD_TIMEOUT_MS,
-//         `getChild:${childId}`
-//       );
-//       if (!child) throw new Error(`Child not found: ${childId}`);
-//       childCache.set(childId, child);
-//     }
-//     return childCache.get(childId)!;
-//   }
-
-//   async function getParentCached(parentId: string) {
-//     if (!parentCache.has(parentId)) {
-//       const parent = await withTimeout(
-//         getUser(parentId),
-//         PARENT_TIMEOUT_MS,
-//         `getUser:${parentId}`
-//       );
-//       if (!parent) throw new Error(`Parent not found: ${parentId}`);
-//       parentCache.set(parentId, parent);
-//     }
-//     return parentCache.get(parentId)!;
-//   }
-
-//   async function getCareTeamUidsCached(parentId: string, childId: string) {
-//     const key = `${parentId}:${childId}`;
-//     if (!careTeamCache.has(key)) {
-//       const members = await fetchCareFamilyMembers(parentId, childId); // assume reasonably sized
-//       // Trim immediately to the minimal shape we actually need to send
-//       const slim = (members || []).map((m: any) => ({
-//         uid: m.uid,
-//         allowsPushNotifications: m.allowsPushNotifications,
-//       }));
-//       careTeamCache.set(key, slim);
-//     }
-//     return careTeamCache.get(key)!;
-//   }
-
-//   // ————————————————————————————————————————————————————————————————————————
-//   // Build tasks (memory-friendly): no giant results array; count failures only
-//   // ————————————————————————————————————————————————————————————————————————
-//   let failures = 0;
-
-//   const perEventTasks = batch.map(({ id: eventId, data: event }) =>
-//     updateLimit(async () => {
-//       // a) Fast skip
-//       if (
-//         event.state !== "active" ||
-//         !event.nextNotificationTime ||
-//         event.notificationCount > 5
-//       ) {
-//         logger.log(
-//           `⏩ Skipping ${eventId}: state=${event.state} nextNotificationTime=${event.nextNotificationTime} notificationCount=${event.notificationCount}`
-//         );
-//         return;
-//       }
-
-//       // b) Lookups (lazy + timed)
-//       const child = await getChildCached(event.childId);
-//       const parent = await getParentCached(child.parentId);
-
-//       // c) Prescription (timed)
-//       const prescription = await withTimeout(
-//         getPrescription(event.prescriptionId),
-//         RX_TIMEOUT_MS,
-//         `getRx:${event.prescriptionId}`
-//       );
-//       if (!prescription)
-//         throw new Error(`Prescription not found: ${event.prescriptionId}`);
-
-//       // d) Build notification body (small string, no big objects retained)
-//       const body = prescriptionNotification(
-//         child.childName,
-//         event.notificationCount,
-//         prescription.name
-//       );
-
-//       // e) Sends (DRY_RUN option)
-//       if (!DRY_RUN) {
-//         const sendOps: Array<Promise<unknown>> = [];
-
-//         // parent
-//         if (parent.allowsPushNotifications) {
-//           sendOps.push(
-//             withTimeout(
-//               sendPushNotificationsToUser(parent.uid, body, {
-//                 childId: event.childId,
-//                 eventId,
-//                 screen: "PrimarySchedule",
-//               }),
-//               SEND_TIMEOUT_MS,
-//               `sendPush:parent:${parent.uid}`
-//             )
-//           );
-//         }
-
-//         // care team (use uid-only, minimal shape; throttle with p-limit)
-//         const careTargets = await getCareTeamUidsCached(
-//           child.parentId,
-//           event.childId
-//         );
-//         for (const m of careTargets) {
-//           if (!m.allowsPushNotifications) continue;
-//           sendOps.push(
-//             careTeamLimit(() =>
-//               withTimeout(
-//                 sendPushNotificationsToUser(m.uid, body, {
-//                   childId: event.childId,
-//                   eventId,
-//                   screen: "PrimarySchedule",
-//                 }),
-//                 SEND_TIMEOUT_MS,
-//                 `sendPush:care:${m.uid}`
-//               )
-//             )
-//           );
-//         }
-
-//         // Drain all sends; don’t retain the whole settled array
-//         await Promise.all(
-//           sendOps.map((p) =>
-//             p.catch((err) => {
-//               failures++;
-//               logger.error("❌ send failed", {
-//                 eventId,
-//                 err: String((err && (err as any).message) || err),
-//               });
-//             })
-//           )
-//         );
-//       }
-
-//       // f) Update DB (timed)
-//       await withTimeout(
-//         updatePrescriptionEventNotificationCount(
-//           event,
-//           eventId,
-//           now,
-//           prescription,
-//           parent.timeZone ?? "UTC"
-//         ),
-//         UPDATE_TIMEOUT_MS,
-//         `updateEvent:${eventId}`
-//       );
-
-//       logger.log(`✅ Updated event ${eventId}`);
-//     }).catch((err) => {
-//       // Count & log per-event failures without propagating (so other tasks continue)
-//       failures++;
-//       logger.error("❌ event failed", {
-//         err: String((err && (err as any).message) || err),
-//       });
-//     })
-//   );
-
-//   // ————————————————————————————————————————————————————————————————————————
-//   // Execute the batch
-//   // ————————————————————————————————————————————————————————————————————————
-//   await Promise.all(perEventTasks);
-//   const t3 = Date.now();
-
-//   // Macro timings & counts (cheap, high signal)
-//   logger.log(
-//     `⏱️ timings(ms) snap=${t1 - t0} collect=${t2 - t1} tasks=${t3 - t2} total=${
-//       t3 - t0
-//     }`
-//   );
-//   logger.log(
-//     `📊 counts total=${totalEvents} processed=${batch.length} failures=${failures}`
-//   );
-
-//   if (failures) {
-//     logger.error(`❌ ${failures} event(s) failed this minute`);
-//   } else {
-//     logger.log("✅ All events processed successfully");
-//   }
-// };
 
 function getNotificationMessage(child: any, event: any): string {
   const notificationCount = event.notificationCount;
@@ -1397,8 +1027,8 @@ export async function updatePrescriptionEventNotificationCount(
   prescription: any,
   timeZone: string
 ): Promise<void> {
-  let nextNotificationTime: number;
-
+  // --- 1) compute nextNotificationTime (same logic you had) ---
+  let nextNotificationTime: number | undefined;
   switch (event.notificationCount) {
     case 1:
       nextNotificationTime =
@@ -1416,28 +1046,29 @@ export async function updatePrescriptionEventNotificationCount(
       nextNotificationTime =
         currentTime + (event.snoozeInterval || 15) * 60 * 1000;
       break;
+    default:
+      // If somehow 0/undefined/≥5 arrives, just no-op the snooze calculation.
+      nextNotificationTime = undefined;
   }
 
-  const newNotificationCount = event.notificationCount + 1;
-  const updates: Partial<{
-    state: string;
-    nextNotificationTime: number | null;
-    notificationCount: number | null;
-    snoozeInterval: number | null;
-    nextScheduledDose: any;
-  }> =
-    newNotificationCount === 5
-      ? {
-          nextNotificationTime: null,
-          notificationCount: null,
-          snoozeInterval: null,
-        }
-      : { nextNotificationTime, notificationCount: newNotificationCount };
+  const newNotificationCount = (Number(event.notificationCount) || 0) + 1;
+
+  // --- 2) Build one multipath 'updates' object ---
+  const updates: Record<string, unknown> = {};
+  const eventBase = `prescription_events/${eventId}`;
 
   if (newNotificationCount === 5) {
-    const newDoseRef = db.ref("prescription_doses").push();
+    // terminal: clear scheduling fields on the event
+    updates[`${eventBase}/nextNotificationTime`] = null;
+    updates[`${eventBase}/notificationCount`] = null;
+    updates[`${eventBase}/snoozeInterval`] = null;
+
+    // create the dose *in the same update* (no push().set round-trip)
+    const doseRef = db.ref("prescription_doses").push();
+    const doseId = doseRef.key as string;
+
     const dose = {
-      id: newDoseRef.key,
+      id: doseId,
       prescriptionEventId: eventId,
       date: event.nextScheduledDose,
       given: false,
@@ -1445,59 +1076,24 @@ export async function updatePrescriptionEventNotificationCount(
       name: prescription.name,
       dose: prescription.dose,
     };
-    await newDoseRef.set(dose);
+    updates[`prescription_doses/${doseId}`] = dose;
 
+    // compute and write the next cycle’s scheduled dose
     const timeStamp = calculateNextDose(prescription, timeZone);
-    logger.log(
-      "timeStamp in updatePrescriptionEventNotificationCount",
-      timeStamp
-    );
-    updates.nextScheduledDose = timeStamp;
+    updates[`${eventBase}/nextScheduledDose`] = timeStamp;
+  } else {
+    // non-terminal: bump count + set nextNotificationTime
+    if (typeof nextNotificationTime === "number") {
+      updates[`${eventBase}/nextNotificationTime`] = nextNotificationTime;
+    }
+    updates[`${eventBase}/notificationCount`] = newNotificationCount;
   }
 
-  logger.log(`💾 Updating event ${eventId} with new notificationCount`);
-  await db.ref(`prescription_events/${eventId}`).update(updates);
-  logger.log(`✅ Event ${eventId} updated`);
+  // --- 3) One atomic write for everything above ---
+  // logger.log(`💾 Updating event ${eventId} (multi-path)`);
+  await db.ref().update(updates);
+  // logger.log(`✅ Event ${eventId} updated (count → ${newNotificationCount})`);
 }
-
-// const fetchCareFamilyMembers = async (parentId: string, childID: string) => {
-//   try {
-//     const careFamilySnapshot = await db
-//       .ref("caregiver")
-//       .orderByChild("parent_id")
-//       .equalTo(parentId)
-//       .once("value");
-
-//     const careFamilyMembers = [];
-//     careFamilySnapshot.forEach((snapshot) => {
-//       const memberData = snapshot.val();
-//       // Only add caregiver if their `childs` array contains the specified `childID`
-//       if (memberData.children && memberData.children.includes(childID)) {
-//         careFamilyMembers.push(memberData);
-//       }
-//     });
-
-//     const caregiverPromises = careFamilyMembers.map(async (caregiver) => {
-//       const caregiverData = await db
-//         .ref(`users/${caregiver.caregiver_id}`)
-//         .once("value");
-
-//       const caregiverDetails = caregiverData.val();
-//       return caregiverDetails && caregiverDetails.allowsPushNotifications
-//         ? caregiverDetails
-//         : null;
-//     });
-
-//     const validCaregivers = (await Promise.all(caregiverPromises)).filter(
-//       Boolean
-//     );
-
-//     return validCaregivers; // Return caregivers with allowsPushNotifications === true
-//   } catch (error) {
-//     logger.error("Error fetching care family members:", error);
-//     return [];
-//   }
-// };
 
 const fetchCareFamilyMembers = async (parentId: string, childId: string) => {
   try {
@@ -1634,7 +1230,7 @@ async function sendPushNotificationsToUser(
     };
 
     const response = await admin.messaging().send(message);
-    logger.log(`Successfully sent message:`, response);
+    // logger.log(`Successfully sent message:`, response);
     return response;
   } catch (error) {
     if (
