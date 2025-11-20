@@ -243,7 +243,7 @@ export const processPrescriptionNextNotificationCron = onSchedule(
       instance: process.env.K_INSTANCE,
       node: process.version,
     });
-    logger.log("🕑 start:", new Date(start).toISOString());
+    // logger.log("🕑 start:", new Date(start).toISOString());
 
     // ✅ 2. Quick proof that the event loop is alive
     setTimeout(() => logger.log("⏱️ cron:loop-alive-after-1s"), 1000);
@@ -717,7 +717,7 @@ export const processPrescriptionNextNotificationTime = async () => {
   const minuteStart = getStartOfMinute(now);
   const minuteEnd = getEndOfMinute(now);
   logger.log("🕑 now:", new Date(now).toISOString());
-  logger.log("🕑 now:", new Date(now).toISOString());
+  // logger.log("🕑 now:", new Date(now).toISOString());
 
   const snap = await db
     .ref("prescription_events")
@@ -1339,32 +1339,45 @@ const removeAllCaregiversForUser = async (userId) => {
 export function calculateNextDose(prescription: any, timeZone: string): number {
   const { frequency, startDate, reminderTimes } = prescription || {};
   const currentTime = moment.tz(timeZone).valueOf();
-  logger.log("calculateNextDose currentTime", currentTime, prescription);
+
+  logger.log("calculateNextDose prescription", prescription, timeZone);
+  logger.log("calculateNextDose currentTime", currentTime);
+
+  // Safety: cap iterations to avoid infinite loops
+  // let hops = 0;
+  // const MAX_HOPS = 5;
 
   // Ensure nextDose is at least `startDate` and after the current time
-  let nextDose = Math.max(
-    moment.tz(startDate, timeZone).valueOf(),
-    currentTime
-  );
+  let nextDose = Math.max(startDate, currentTime);
 
   switch (frequency?.type) {
-    case FrequencyInterval.HOURLY:
-      if (!frequency?.interval) {
-        throw new Error("Frequency interval is required for HOURLY type.");
+    case FrequencyInterval.HOURLY: {
+      const intervalHrs = Number(frequency.interval);
+      if (!intervalHrs || intervalHrs < 1 || intervalHrs > 12) {
+        throw new Error("For HOURLY, interval (1-12) is required.");
       }
-      const hourlyInterval = frequency.interval * 60 * 60 * 1000; // Convert hours to ms
-      nextDose = new Date(startDate).getTime(); // Start from the given startDate
+      // Anchor at the schedule’s intended start instant (epoch ms).
+      // Prefer frequency.startDate if provided; otherwise use prescription.startDate.
+      const anchorMs = Number(frequency.startDate ?? startDate);
+      const intervalMs = intervalHrs * 60 * 60 * 1000;
 
-      // Increment by the interval until nextDose is after the current time
-      while (nextDose <= currentTime) {
-        nextDose += hourlyInterval;
+      // If we haven't reached the anchor yet, first dose is exactly at anchor.
+      if (currentTime <= anchorMs) {
+        nextDose = anchorMs;
+      } else {
+        // Jump directly to the first occurrence strictly after "now".
+        const elapsed = currentTime - anchorMs;
+        const steps = Math.ceil(elapsed / intervalMs);
+        nextDose = anchorMs + steps * intervalMs;
       }
       break;
-
-    case FrequencyInterval.DAILY:
+    }
+    case FrequencyInterval.DAILY: {
+      const tz = prescription.timeZone || timeZone || "UTC";
+      const countPerDay = Number(frequency?.interval);
       if (
-        !frequency?.interval ||
-        !reminderTimes ||
+        !countPerDay ||
+        !Array.isArray(reminderTimes) ||
         reminderTimes.length === 0
       ) {
         throw new Error(
@@ -1372,204 +1385,453 @@ export function calculateNextDose(prescription: any, timeZone: string): number {
         );
       }
 
-      const dailyStart = Math.max(new Date(startDate).getTime(), currentTime);
-      let searchDate = new Date(dailyStart);
+      const sortedTimes = reminderTimes
+        .filter((t: number) => Number.isFinite(t))
+        .map((t: number) => Math.max(0, Math.min(t, 24 * 60 * 60 * 1000 - 1)))
+        .sort((a: number, b: number) => a - b);
 
-      while (true) {
-        const dayMidnight = moment
-          .tz(
-            {
-              year: searchDate.getFullYear(),
-              month: searchDate.getMonth(), // Month is 0-indexed in both JavaScript Date and moment
-              day: searchDate.getDate(),
-              hour: 0,
-              minute: 0,
-              second: 0,
-            },
-            timeZone
-          )
-          .valueOf(); // Returns the epoch time in milliseconds
+      const dayTimes = sortedTimes.slice(0, countPerDay);
+      if (dayTimes.length === 0) {
+        throw new Error("DAILY requires at least one valid reminder time.");
+      }
 
-        for (const reminderTime of reminderTimes) {
-          const potentialDose = dayMidnight + reminderTime;
+      const nowZ = moment.tz(currentTime, tz);
+      const startZ = moment.tz(Number(startDate), tz);
+      const ref = nowZ.isAfter(startZ) ? nowZ : startZ;
+      const dayStart = ref.clone().startOf("day");
+      // try today
+      for (const t of dayTimes) {
+        const h = Math.floor(t / 3600000);
+        const m = Math.floor((t % 3600000) / 60000);
+        const candidate = dayStart
+          .clone()
+          .hour(h)
+          .minute(m)
+          .second(0)
+          .millisecond(0);
+        if (candidate.isAfter(ref)) {
           if (
-            potentialDose > currentTime &&
-            potentialDose >= moment.tz(startDate, timeZone).valueOf()
+            typeof prescription.endDate === "number" &&
+            candidate.valueOf() > prescription.endDate
           ) {
-            nextDose = potentialDose;
-            break;
+            throw new Error(
+              "No next dose: next occurrence would be after end date."
+            );
           }
-        }
-
-        if (nextDose > currentTime) {
+          nextDose = candidate.valueOf();
           break;
         }
+      }
+      // if we didn’t set nextDose from today, schedule the first time tomorrow
+      if (nextDose <= currentTime) {
+        const first = dayTimes[0];
+        const fh = Math.floor(first / 3600000);
+        const fm = Math.floor((first % 3600000) / 60000);
+        const nextDayCandidate = dayStart
+          .clone()
+          .add(1, "day")
+          .hour(fh)
+          .minute(fm)
+          .second(0)
+          .millisecond(0);
 
-        searchDate = new Date(dayMidnight + 24 * 60 * 60 * 1000);
+        if (
+          typeof prescription.endDate === "number" &&
+          nextDayCandidate.valueOf() > prescription.endDate
+        ) {
+          throw new Error(
+            "No next dose: next occurrence would be after end date."
+          );
+        }
+
+        nextDose = nextDayCandidate.valueOf();
       }
       break;
+    }
+    case FrequencyInterval.WEEKLY: {
+      const tz = prescription.timeZone || timeZone || "UTC";
 
-    case FrequencyInterval.WEEKLY:
-      if (
-        !frequency?.interval ||
-        !reminderTimes ||
-        reminderTimes.length === 0
-      ) {
+      const weeksInterval = Number(frequency?.interval);
+      if (!weeksInterval || weeksInterval < 1) {
+        throw new Error("WEEKLY requires a positive interval (weeks).");
+      }
+      if (!Array.isArray(reminderTimes) || reminderTimes.length !== 1) {
         throw new Error(
-          "Frequency interval and reminderTimes are required for WEEKLY type."
+          "WEEKLY requires exactly one reminderTime (ms since local midnight)."
         );
       }
 
-      const weeklyInterval = frequency.interval * 7 * 24 * 60 * 60 * 1000; // weeks in ms
-      let weeklyTime = new Date(startDate).getTime() + reminderTimes[0]; // First dose: startDate + first reminder time
-      while (weeklyTime <= currentTime) {
-        weeklyTime += weeklyInterval;
+      // Convert reminderTime (ms since local midnight) → H/M
+      const rt = Math.max(
+        0,
+        Math.min(reminderTimes[0], 24 * 60 * 60 * 1000 - 1)
+      );
+      const hh = Math.floor(rt / 3_600_000);
+      const mm = Math.floor((rt % 3_600_000) / 60_000);
+
+      const nowZ = moment.tz(currentTime, tz);
+      const startZ = moment.tz(Number(startDate), tz);
+      const ref = nowZ.isAfter(startZ) ? nowZ : startZ;
+
+      // Anchor cadence to the week that contains startDate
+      const anchorWeekStart = startZ.clone().startOf("week"); // locale week (US: Sunday-start)
+      const refWeekStart = ref.clone().startOf("week");
+
+      // Weeks since anchor and alignment modulo
+      const weeksSinceAnchor = refWeekStart.diff(anchorWeekStart, "weeks"); // integer
+      const mod =
+        ((weeksSinceAnchor % weeksInterval) + weeksInterval) % weeksInterval;
+
+      // We always schedule on the same weekday as startDate
+      const anchorWeekday = startZ.day(); // 0..6 (Sun..Sat)
+
+      // Helper to build the candidate in a given aligned week index
+      const buildCandidate = (weekIndexFromAnchor: number) =>
+        anchorWeekStart
+          .clone()
+          .add(weekIndexFromAnchor, "weeks")
+          .day(anchorWeekday)
+          .hour(hh)
+          .minute(mm)
+          .second(0)
+          .millisecond(0);
+
+      // 1) If current week is an alignment week, try this week's occurrence
+      if (mod === 0) {
+        const candidate = buildCandidate(weeksSinceAnchor);
+        if (candidate.isAfter(ref) && candidate.isSameOrAfter(startZ)) {
+          nextDose = candidate.valueOf();
+          break;
+        }
       }
 
-      nextDose = weeklyTime;
-      break;
+      // 2) Otherwise jump to the next alignment week: add (interval - mod) weeks
+      const weeksToAdd = mod === 0 ? weeksInterval : weeksInterval - mod;
+      let nextIndex = weeksSinceAnchor + weeksToAdd;
 
-    case FrequencyInterval.CERTAIN_DAYS:
-      if (!frequency?.daysOfWeek || frequency?.daysOfWeek.length === 0) {
+      // Build the next aligned occurrence; if somehow before startZ (edge), push one block forward
+      let candidate = buildCandidate(nextIndex);
+      if (candidate.isBefore(startZ)) {
+        nextIndex += weeksInterval;
+        candidate = buildCandidate(nextIndex);
+      }
+
+      nextDose = candidate.valueOf();
+      break;
+    }
+    case FrequencyInterval.CERTAIN_DAYS: {
+      const tz = prescription.timeZone || timeZone || "UTC";
+
+      const days = frequency?.daysOfWeek as number[] | undefined; // 0=Sun..6=Sat
+      if (!Array.isArray(days) || days.length === 0) {
         throw new Error("Days of the week are required for CERTAIN_DAYS type.");
       }
-      if (!reminderTimes || reminderTimes.length === 0) {
+      if (!Array.isArray(reminderTimes) || reminderTimes.length === 0) {
         throw new Error("Reminder times are required for CERTAIN_DAYS type.");
       }
 
-      let searchTime = Math.max(new Date(startDate).getTime(), currentTime);
-      while (true) {
-        const searchDateObj = new Date(searchTime);
-        const currentDayIndex = searchDateObj.getDay();
+      // normalize + sort weekdays
+      const allowedDays = [...new Set(days)].sort((a, b) => a - b);
 
-        if (frequency.daysOfWeek.includes(currentDayIndex)) {
-          const dayMidnight = moment
-            .tz(
-              {
-                year: searchDateObj.getFullYear(),
-                month: searchDateObj.getMonth(),
-                day: searchDateObj.getDate(),
-                hour: 0,
-                minute: 0,
-                second: 0,
-              },
-              timeZone
-            )
-            .valueOf();
+      // normalize reminderTimes (ms since local midnight) -> [ {ms,h,m} ], sorted by ms
+      const times = reminderTimes
+        .filter((t: number) => Number.isFinite(t))
+        .map((t: number) => Math.max(0, Math.min(t, 86_399_999))) // clamp to day
+        .sort((a: number, b: number) => a - b)
+        .map((ms) => ({
+          ms,
+          h: Math.floor(ms / 3_600_000),
+          m: Math.floor((ms % 3_600_000) / 60_000),
+        }));
 
-          for (const reminderTime of reminderTimes) {
-            const potentialDose = dayMidnight + reminderTime;
+      const nowZ = moment.tz(currentTime, tz);
+      const startZ = moment.tz(Number(startDate), tz);
+      const ref = nowZ.isAfter(startZ) ? nowZ : startZ;
+
+      const todayStart = ref.clone().startOf("day");
+
+      let found = false;
+
+      // Search today + next 6 days (at most 7 iterations)
+      for (let d = 0; d < 7 && !found; d++) {
+        const dayStart = todayStart.clone().add(d, "day");
+        const weekday = dayStart.day(); // 0..6
+
+        if (!allowedDays.includes(weekday)) continue;
+
+        for (const { h, m } of times) {
+          // set civil time; this is DST-safe
+          const candidate = dayStart
+            .clone()
+            .hour(h)
+            .minute(m)
+            .second(0)
+            .millisecond(0);
+          if (candidate.isAfter(ref)) {
             if (
-              potentialDose > currentTime &&
-              potentialDose >= moment.tz(startDate, timeZone).valueOf()
+              typeof prescription.endDate === "number" &&
+              candidate.valueOf() > prescription.endDate
             ) {
-              nextDose = potentialDose;
-              break;
+              throw new Error(
+                "No next dose: next occurrence would be after end date."
+              );
             }
-          }
 
-          if (nextDose > currentTime) {
+            nextDose = candidate.valueOf();
+            found = true;
             break;
           }
         }
-
-        searchTime += 24 * 60 * 60 * 1000; // Add a day
-      }
-      break;
-
-    case FrequencyInterval.MONTHLY:
-      if (
-        !frequency?.interval ||
-        !reminderTimes ||
-        reminderTimes.length === 0
-      ) {
-        throw new Error(
-          "Months interval and reminderTimes are required for MONTHLY type."
-        );
       }
 
-      let monthlyTime = new Date(startDate).getTime() + reminderTimes[0]; // First dose: startDate + first reminder time
+      if (!found) {
+        // Extremely rare (e.g., all times today were before ref and the only allowed day is >7 days away,
+        // which cannot happen). As a safe fallback, jump one week to the first allowed day/time.
+        const firstDay = allowedDays[0];
+        const firstTime = times[0];
+        const fallback = todayStart
+          .clone()
+          .add(7, "days")
+          .day(firstDay)
+          .hour(firstTime.h)
+          .minute(firstTime.m)
+          .second(0)
+          .millisecond(0);
 
-      while (monthlyTime <= currentTime) {
-        const currentDateObj = new Date(monthlyTime);
-        const nextMonthDate = new Date(
-          currentDateObj.getFullYear(),
-          currentDateObj.getMonth() + frequency.interval,
-          currentDateObj.getDate(),
-          currentDateObj.getHours(),
-          currentDateObj.getMinutes(),
-          currentDateObj.getSeconds()
-        );
-        monthlyTime = nextMonthDate.getTime();
-      }
-
-      nextDose = monthlyTime;
-      break;
-
-    case FrequencyInterval.EVERY_OTHER_DAY:
-      if (!reminderTimes || reminderTimes.length === 0) {
-        throw new Error(
-          "Reminder times are required for EVERY_OTHER_DAY type."
-        );
-      }
-
-      const everyOtherDayInterval = 2 * 24 * 60 * 60 * 1000; // 2 days in ms
-      nextDose = new Date(startDate).getTime();
-
-      while (true) {
-        const nextDoseDate = new Date(nextDose);
-        const dayMidnight = moment
-          .tz(
-            {
-              year: nextDoseDate.getFullYear(),
-              month: nextDoseDate.getMonth(),
-              day: nextDoseDate.getDate(),
-              hour: 0,
-              minute: 0,
-              second: 0,
-            },
-            timeZone
-          )
-          .valueOf();
-
-        let foundDose = false;
-        for (const reminderTime of reminderTimes) {
-          const potentialDose = dayMidnight + reminderTime;
-          if (potentialDose > currentTime) {
-            nextDose = potentialDose;
-            foundDose = true;
-            break;
-          }
+        if (
+          typeof prescription.endDate === "number" &&
+          fallback.valueOf() > prescription.endDate
+        ) {
+          throw new Error(
+            "No next dose: next occurrence would be after end date."
+          );
         }
 
-        if (foundDose) {
+        nextDose = fallback.valueOf();
+      }
+
+      break;
+    }
+    case FrequencyInterval.MONTHLY: {
+      const tz = prescription.timeZone || timeZone || "UTC";
+
+      const monthsInterval = Number(frequency?.interval);
+      if (!monthsInterval || monthsInterval < 1 || monthsInterval > 12) {
+        throw new Error("MONTHLY requires interval between 1 and 12.");
+      }
+      if (!Array.isArray(reminderTimes) || reminderTimes.length !== 1) {
+        throw new Error(
+          "MONTHLY requires exactly one reminderTime (ms since local midnight)."
+        );
+      }
+
+      // Convert reminderTime (ms since local midnight) → H/M
+      const rt = Math.max(0, Math.min(reminderTimes[0], 86_399_999));
+      const hh = Math.floor(rt / 3_600_000);
+      const mm = Math.floor((rt % 3_600_000) / 60_000);
+
+      const nowZ = moment.tz(currentTime, tz);
+      const startZ = moment.tz(Number(startDate), tz);
+      const ref = nowZ.isAfter(startZ) ? nowZ : startZ;
+
+      // Anchor to the month containing startDate
+      const anchorMonthStart = startZ.clone().startOf("month");
+      const refMonthStart = ref.clone().startOf("month");
+
+      // How many whole months since anchor?
+      const monthsSinceAnchor = refMonthStart.diff(anchorMonthStart, "months"); // integer
+
+      // alignment modulo (0 means this month is an aligned month)
+      const mod =
+        ((monthsSinceAnchor % monthsInterval) + monthsInterval) %
+        monthsInterval;
+
+      const anchorDay = startZ.date(); // 1..31
+
+      const buildCandidate = (monthsFromAnchor: number) => {
+        const base = anchorMonthStart.clone().add(monthsFromAnchor, "months");
+        const dim = base.daysInMonth();
+        const day = Math.min(anchorDay, dim); // clamp to last day if needed
+        return base.date(day).hour(hh).minute(mm).second(0).millisecond(0);
+      };
+
+      let candidate: moment.Moment;
+
+      // 1) If this month is aligned, try it first
+      if (mod === 0) {
+        candidate = buildCandidate(monthsSinceAnchor);
+        if (candidate.isAfter(ref) && candidate.isSameOrAfter(startZ)) {
+          const v = candidate.valueOf();
+          if (
+            typeof prescription.endDate === "number" &&
+            v > prescription.endDate
+          ) {
+            throw new Error(
+              "No next dose: next occurrence would be after end date."
+            );
+          }
+          nextDose = v;
           break;
         }
-
-        nextDose += everyOtherDayInterval;
       }
+
+      // 2) Otherwise jump to next aligned month (or from aligned month if today’s time has passed)
+      const monthsToAdd = mod === 0 ? monthsInterval : monthsInterval - mod;
+      candidate = buildCandidate(monthsSinceAnchor + monthsToAdd);
+
+      // Guard against startZ being later than computed slot (rare): push another interval
+      if (candidate.isBefore(startZ)) {
+        candidate = buildCandidate(
+          monthsSinceAnchor + monthsToAdd + monthsInterval
+        );
+      }
+
+      const v = candidate.valueOf();
+      if (
+        typeof prescription.endDate === "number" &&
+        v > prescription.endDate
+      ) {
+        throw new Error(
+          "No next dose: next occurrence would be after end date."
+        );
+      }
+      nextDose = v;
       break;
-    case FrequencyInterval.ONCE_A_WEEKLY:
-      if (!reminderTimes || reminderTimes.length === 0) {
-        throw new Error("Reminder times are required for ONCE_A_WEEKLY type.");
+    }
+    case FrequencyInterval.EVERY_OTHER_DAY: {
+      const tz = prescription.timeZone || timeZone || "UTC";
+
+      if (!Array.isArray(reminderTimes) || reminderTimes.length !== 1) {
+        throw new Error(
+          "EVERY_OTHER_DAY requires exactly one reminderTime (ms since local midnight)."
+        );
       }
 
-      // ONCE_A_WEEKLY implies a 1-week interval
-      const onceWeeklyInterval = 7 * 24 * 60 * 60 * 1000; // 7 days in ms
-      let onceWeeklyTime = startDate + reminderTimes[0]; // The first occurrence is startDate + reminderTime
+      // Convert reminderTime (ms since local midnight) → H/M (civil time)
+      const rt = Math.max(0, Math.min(reminderTimes[0], 86_399_999));
+      const hh = Math.floor(rt / 3_600_000);
+      const mm = Math.floor((rt % 3_600_000) / 60_000);
 
-      // If the first occurrence is in the past, move forward week by week until it's in the future
-      while (onceWeeklyTime <= currentTime) {
-        onceWeeklyTime += onceWeeklyInterval;
+      const nowZ = moment.tz(currentTime, tz);
+      const startZ = moment.tz(Number(startDate), tz);
+      const ref = nowZ.isAfter(startZ) ? nowZ : startZ;
+
+      // Anchor: the day that contains startDate in schedule TZ
+      const anchorDayStart = startZ.clone().startOf("day");
+      const refDayStart = ref.clone().startOf("day");
+
+      // How many whole days since the anchor day?
+      const daysSinceAnchor = refDayStart.diff(anchorDayStart, "days"); // integer
+      const mod = ((daysSinceAnchor % 2) + 2) % 2; // 0 if today is an aligned day, 1 if not
+
+      const buildCandidate = (dayStart: moment.Moment) =>
+        dayStart.clone().hour(hh).minute(mm).second(0).millisecond(0);
+
+      let candidate: moment.Moment;
+
+      if (mod === 0) {
+        // Today is an aligned day — try today's time
+        candidate = buildCandidate(refDayStart);
+        if (!candidate.isAfter(ref)) {
+          // Today's time already passed → jump two days to keep the even/odd pattern
+          candidate = buildCandidate(refDayStart.clone().add(2, "days"));
+        }
+      } else {
+        // Not an aligned day — next aligned day is tomorrow (1 day ahead)
+        candidate = buildCandidate(refDayStart.clone().add(1, "day"));
       }
 
-      nextDose = onceWeeklyTime;
+      // Optional endDate guard
+      const v = candidate.valueOf();
+      if (
+        typeof prescription.endDate === "number" &&
+        v > prescription.endDate
+      ) {
+        throw new Error(
+          "No next dose: next occurrence would be after end date."
+        );
+      }
+
+      nextDose = v;
       break;
+    }
+    case FrequencyInterval.ONCE_A_WEEKLY: {
+      const tz = prescription.timeZone || timeZone || "UTC";
 
+      if (!Array.isArray(reminderTimes) || reminderTimes.length !== 1) {
+        throw new Error(
+          "ONCE_A_WEEKLY requires exactly one reminderTime (ms since local midnight)."
+        );
+      }
+
+      // convert reminderTime (ms since local midnight) → H/M
+      const rt = Math.max(
+        0,
+        Math.min(reminderTimes[0], 24 * 60 * 60 * 1000 - 1)
+      );
+      const hh = Math.floor(rt / 3_600_000);
+      const mm = Math.floor((rt % 3_600_000) / 60_000);
+
+      const nowZ = moment.tz(currentTime, tz);
+      const startZ = moment.tz(Number(startDate), tz);
+      const ref = nowZ.isAfter(startZ) ? nowZ : startZ;
+
+      // Anchor cadence to the week containing startDate (US locale week = Sunday start).
+      // If you want ISO weeks (Mon start), use 'isoWeek' and 'isoWeekday'.
+      const anchorWeekStart = startZ.clone().startOf("week");
+      const refWeekStart = ref.clone().startOf("week");
+
+      // Weeks since anchor and the same weekday as startDate
+      const weeksSinceAnchor = refWeekStart.diff(anchorWeekStart, "weeks"); // integer
+      const anchorWeekday = startZ.day(); // 0..6 (Sun..Sat)
+
+      const buildCandidate = (weekIndexFromAnchor: number) =>
+        anchorWeekStart
+          .clone()
+          .add(weekIndexFromAnchor, "weeks")
+          .day(anchorWeekday)
+          .hour(hh)
+          .minute(mm)
+          .second(0)
+          .millisecond(0);
+
+      // Try this week's occurrence (same weekday/time) if it's strictly after ref
+      let candidate = buildCandidate(weeksSinceAnchor);
+      if (candidate.isAfter(ref) && candidate.isSameOrAfter(startZ)) {
+        if (
+          typeof prescription.endDate === "number" &&
+          candidate.valueOf() > prescription.endDate
+        ) {
+          throw new Error(
+            "No next dose: next occurrence would be after end date."
+          );
+        }
+        nextDose = candidate.valueOf();
+        break;
+      }
+
+      // Otherwise, take the next week’s occurrence
+      candidate = buildCandidate(weeksSinceAnchor + 1);
+      if (candidate.isBefore(startZ)) {
+        // extremely rare edge if startZ is later than that week’s occurrence—push one more week
+        candidate = buildCandidate(weeksSinceAnchor + 2);
+      }
+
+      if (
+        typeof prescription.endDate === "number" &&
+        candidate.valueOf() > prescription.endDate
+      ) {
+        throw new Error(
+          "No next dose: next occurrence would be after end date."
+        );
+      }
+      nextDose = candidate.valueOf();
+      break;
+    }
     default:
       throw new Error("Unsupported frequency type.");
   }
-
+  logger.log("calculateNextDose nextDose", nextDose);
   return nextDose;
 }
 
@@ -2146,6 +2408,7 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
     const userRef = db.ref(`/users/${userId}`);
     const userSnapshot = await userRef.once("value");
     const userData = userSnapshot.val();
+
     if (userData?.legacySubscription === true) {
       return {
         subscribed: "legacySubscription",
@@ -2153,10 +2416,36 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
       };
     }
 
+    const now = Date.now();
+    const purchaseInfo = userData?.purchaseInfo;
+
+    // -------------------------------------------------
+    // iOS EARLY RETURN: subscribed true + good cache
+    // -------------------------------------------------
+    if (
+      userData?.subscribed === true && // user marked subscribed
+      purchaseInfo?.transactionReceipt && // iOS path
+      !purchaseInfo?.purchaseToken && // ensure not Android
+      typeof purchaseInfo.subscriptionExpiry === "string"
+    ) {
+      const expiryMs = Date.parse(purchaseInfo.subscriptionExpiry);
+
+      if (!Number.isNaN(expiryMs) && expiryMs > now) {
+        logger.log(
+          `Early-returning cached iOS subscription for user ${userId}. ` +
+            `Expiry: ${purchaseInfo.subscriptionExpiry}`
+        );
+
+        return {
+          subscribed: true,
+          subscriptionExpiry: purchaseInfo.subscriptionExpiry,
+        };
+      }
+    }
+
     if (
       !userData ||
-      (!userData.purchaseInfo?.transactionReceipt &&
-        !userData.purchaseInfo?.purchaseToken)
+      (!purchaseInfo?.transactionReceipt && !purchaseInfo?.purchaseToken)
     ) {
       logger.warn(
         `No subscription data found for user: ${userId}. Data: ${JSON.stringify(
@@ -2166,16 +2455,13 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
     }
 
     logger.log(
-      `User subscription data retrieved: ${JSON.stringify(
-        userData.purchaseInfo
-      )}`
+      `User subscription data retrieved: ${JSON.stringify(purchaseInfo)}`
     );
 
     let validationResponse;
-    const now = Date.now();
     let isSubscribed = false;
     let subscriptionExpiry = null;
-    let updatedPurchaseInfo = { ...userData.purchaseInfo };
+    let updatedPurchaseInfo = purchaseInfo ? { ...purchaseInfo } : {};
 
     const applyGracePeriod = (expiryMillis, isAnnual) => {
       const gracePeriod = isAnnual
@@ -2184,11 +2470,14 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
       return expiryMillis + gracePeriod > now;
     };
 
-    if (userData.purchaseInfo?.transactionReceipt) {
+    // ------------------
+    // APPLE (iOS) PATH
+    // ------------------
+    if (purchaseInfo?.transactionReceipt && !purchaseInfo?.purchaseToken) {
       logger.log("Validating with Apple...");
 
       validationResponse = await validateAppleReceipt(
-        userData.purchaseInfo.transactionReceipt
+        purchaseInfo.transactionReceipt
       );
 
       logger.log("Apple validation response:", validationResponse);
@@ -2221,6 +2510,9 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
           }
 
           subscriptionExpiry = new Date(expiryMillis).toISOString();
+
+          // keep purchaseInfo in sync for future early returns
+          updatedPurchaseInfo.subscriptionExpiry = subscriptionExpiry;
           updatedPurchaseInfo.transactionReceipt =
             validationResponse.latest_receipt;
         }
@@ -2229,13 +2521,17 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
           `Apple receipt validation failed with status: ${validationResponse.status}`
         );
       }
-    } else if (userData.purchaseInfo?.purchaseToken) {
+    }
+    // ------------------
+    // GOOGLE (ANDROID) PATH
+    // ------------------
+    else if (purchaseInfo?.purchaseToken) {
       logger.log("Validating with Google...");
 
       validationResponse = await validateGoogleReceipt(
-        userData.purchaseInfo.purchaseToken,
+        purchaseInfo.purchaseToken,
         "com.encurage",
-        userData.purchaseInfo.productId
+        purchaseInfo.productId
       );
 
       logger.log("Google validation response:", validationResponse);
@@ -2258,6 +2554,12 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
           ? new Date(expiryMillis).toISOString()
           : null;
 
+        // If you want to track expiry for Android as well:
+        if (subscriptionExpiry) {
+          updatedPurchaseInfo.subscriptionExpiry = subscriptionExpiry;
+        }
+
+        // If you want to update purchaseToken when linkedPurchaseToken exists:
         // if (validationResponse.linkedPurchaseToken) {
         //   updatedPurchaseInfo.purchaseToken =
         //     validationResponse.linkedPurchaseToken;
@@ -3829,7 +4131,6 @@ function createPrescriptionEvent(
   oldPres: OldPrescription, // the original old data if needed
   timeZone: string
 ): Prescription_events {
-  logger.log();
   const nextDose = calculateNextDose(newPres, timeZone);
   logger.log("nextDose", nextDose);
   const event: Prescription_events = {
