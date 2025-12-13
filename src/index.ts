@@ -335,11 +335,12 @@ export const checkEventDoses = async () => {
         // Step 3: Prepare notification message
         try {
           if (child) {
-            notificationBody = `${
-              child.childName
-            } can get the next ${capitalizeFirstLetter(
-              event.cycle
-            )} dose now. Tap to give the dose.`;
+            const parentLanguage = getPnLanguage(parent);
+            const cycle = capitalizeFirstLetter(event.cycle);
+            notificationBody =
+              parentLanguage === "es"
+                ? `${child.childName} puede recibir la siguiente dosis de ${cycle} ahora. Pulsa aquí para administrar la dosis.`
+                : `${child.childName} can get the next ${cycle} dose now. Tap to give the dose.`;
           }
         } catch (error) {
           logger.error(
@@ -359,8 +360,7 @@ export const checkEventDoses = async () => {
           }
         } catch (error) {
           logger.error(
-            `Error sending notification to parent ${
-              parent ? parent.uid : "unknown"
+            `Error sending notification to parent ${parent ? parent.uid : "unknown"
             } for event ${eventId}:`,
             error
           );
@@ -377,13 +377,22 @@ export const checkEventDoses = async () => {
               (member) => member.allowsPushNotifications
             );
             const memberResults = await Promise.allSettled(
-              eligibleMembers.map((member) =>
-                sendPushNotificationsToUser(member.uid, notificationBody, {
+              eligibleMembers.map((member) => {
+                const memberLanguage = getPnLanguage({
+                  pnLanguage: member.pnLanguage,
+                });
+                const cycle = capitalizeFirstLetter(event.cycle);
+                const memberBody =
+                  memberLanguage === "es"
+                    ? `${child.childName} puede recibir la siguiente dosis de ${cycle} ahora. Pulsa aquí para administrar la dosis.`
+                    : `${child.childName} can get the next ${cycle} dose now. Tap to give the dose.`;
+
+                return sendPushNotificationsToUser(member.uid, memberBody, {
                   childId: event.childId,
                   eventId: eventId,
                   screen: "EpisodeSchedule",
-                })
-              )
+                });
+              })
             );
             memberResults.forEach((result) => {
               if (result.status === "rejected") {
@@ -474,7 +483,12 @@ export const checkNextNotificationTime = async () => {
         try {
           if (child) {
             // Send notification to parent if they allow push notifications
-            notificationBody = getNotificationMessage(child, event);
+            const parentLanguage = getPnLanguage(parent);
+            notificationBody = getNotificationMessage(
+              child,
+              event,
+              parentLanguage
+            );
           }
         } catch (error) {
           logger.error(
@@ -494,8 +508,7 @@ export const checkNextNotificationTime = async () => {
           }
         } catch (error) {
           logger.error(
-            `Error sending notification to parent ${
-              parent ? parent.uid : "unknown"
+            `Error sending notification to parent ${parent ? parent.uid : "unknown"
             } for event ${eventId}:`,
             error
           );
@@ -512,13 +525,21 @@ export const checkNextNotificationTime = async () => {
               (member) => member.allowsPushNotifications
             );
             const memberResults = await Promise.allSettled(
-              eligibleMembers.map((member) =>
-                sendPushNotificationsToUser(member.uid, notificationBody, {
+              eligibleMembers.map((member) => {
+                const memberLanguage = getPnLanguage({
+                  pnLanguage: member.pnLanguage,
+                });
+                const bodyForMember = getNotificationMessage(
+                  child,
+                  event,
+                  memberLanguage
+                );
+                return sendPushNotificationsToUser(member.uid, bodyForMember, {
                   childId: event.childId,
                   eventId: eventId,
                   screen: "EpisodeSchedule",
-                })
-              )
+                });
+              })
             );
             memberResults.forEach((result) => {
               if (result.status === "rejected") {
@@ -629,11 +650,12 @@ export const processPrescriptionEvents = async () => {
           notificationBodyParts.childName &&
           notificationBodyParts.prescriptionName
         ) {
-          notificationBody = `It's time for ${
-            notificationBodyParts.childName
-          }'s next dose of ${capitalizeFirstLetter(
-            notificationBodyParts.prescriptionName
-          )}. Tap to give the dose.`;
+          const parentLanguage = getPnLanguage(parent);
+          const med = capitalizeFirstLetter(notificationBodyParts.prescriptionName);
+          notificationBody =
+            parentLanguage === "es"
+              ? `Es tiempo de la siguiente dosis de ${med} para ${notificationBodyParts.childName}. Pulsa para administrar la dosis.`
+              : `It's time for ${notificationBodyParts.childName}'s next dose of ${med}. Tap to give the dose.`;
         }
 
         // Send notification to parent if allowed.
@@ -647,8 +669,7 @@ export const processPrescriptionEvents = async () => {
           }
         } catch (error) {
           logger.error(
-            `Error sending notification to parent ${
-              parent ? parent.uid : "unknown"
+            `Error sending notification to parent ${parent ? parent.uid : "unknown"
             }`,
             error
           );
@@ -665,13 +686,24 @@ export const processPrescriptionEvents = async () => {
               (member) => member.allowsPushNotifications
             );
             const memberResults = await Promise.allSettled(
-              eligibleMembers.map((member) =>
-                sendPushNotificationsToUser(member.uid, notificationBody, {
+              eligibleMembers.map((member) => {
+                const memberLanguage = getPnLanguage({
+                  pnLanguage: member.pnLanguage,
+                });
+                const med = capitalizeFirstLetter(
+                  notificationBodyParts.prescriptionName as string
+                );
+                const memberBody =
+                  memberLanguage === "es"
+                    ? `Es tiempo de la siguiente dosis de ${med} para ${notificationBodyParts.childName}. Pulsa para administrar la dosis.`
+                    : `It's time for ${notificationBodyParts.childName}'s next dose of ${med}. Tap to give the dose.`;
+
+                return sendPushNotificationsToUser(member.uid, memberBody, {
                   childId: event.childId,
                   eventId: eventId,
                   screen: "PrimarySchedule",
-                })
-              )
+                });
+              })
             );
             memberResults.forEach((result) => {
               if (result.status === "rejected") {
@@ -883,10 +915,12 @@ export const processPrescriptionNextNotificationTime = async () => {
           if (!prescription)
             throw new Error(`Prescription not found: ${event.prescriptionId}`);
 
+          const parentLanguage = getPnLanguage(parent);
           const body = prescriptionNotification(
             child.childName,
             event.notificationCount,
-            prescription.name
+            prescription.name,
+            parentLanguage
           );
 
           if (parent.allowsPushNotifications) {
@@ -904,13 +938,22 @@ export const processPrescriptionNextNotificationTime = async () => {
           await Promise.allSettled(
             careFamilyMembers
               .filter((m) => m.allowsPushNotifications)
-              .map((m) =>
-                sendPushNotificationsToUser(m.uid, body, {
+              .map((m) => {
+                const memberLanguage = getPnLanguage({
+                  pnLanguage: m.pnLanguage,
+                });
+                const memberBody = prescriptionNotification(
+                  child.childName,
+                  event.notificationCount,
+                  prescription.name,
+                  memberLanguage
+                );
+                return sendPushNotificationsToUser(m.uid, memberBody, {
                   childId: event.childId,
                   eventId,
                   screen: "PrimarySchedule",
-                })
-              )
+                });
+              })
           );
 
           await updatePrescriptionEventNotificationCount(
@@ -941,10 +984,40 @@ export const processPrescriptionNextNotificationTime = async () => {
   // return null;
 };
 
-function getNotificationMessage(child: any, event: any): string {
+type PnLanguage = "en" | "es";
+
+const getPnLanguage = (user?: { pnLanguage?: string }): PnLanguage => {
+  const lang =
+    typeof user?.pnLanguage === "string"
+      ? user.pnLanguage.toLowerCase()
+      : "en";
+  return lang === "es" ? "es" : "en";
+};
+
+function getNotificationMessage(
+  child: any,
+  event: any,
+  language: PnLanguage = "en"
+): string {
   const notificationCount = event.notificationCount;
   const cycle = capitalizeFirstLetter(event.cycle);
   const childName = child.childName;
+
+  if (language === "es") {
+    switch (notificationCount) {
+      case 1:
+        return `Recordatorio 2: la dosis de ${cycle} de ${childName} está disponible.`;
+      case 2:
+        return `Recordatorio 3: la dosis de ${cycle} de ${childName} está disponible.`;
+      case 3:
+        return `Recordatorio 4: la dosis de ${cycle} de ${childName} está disponible.`;
+      case 4:
+        return `El episodio de ${cycle} de ${childName} está en pausa. Pulsa para continuar.`;
+      default:
+        return `${childName} puede recibir la siguiente dosis de ${cycle} ahora.`;
+    }
+  }
+
   switch (notificationCount) {
     case 1:
       return `2nd reminder: ${childName}'s ${cycle} dose is available.`;
@@ -962,9 +1035,25 @@ function getNotificationMessage(child: any, event: any): string {
 function prescriptionNotification(
   childName: string,
   notificationCount: any,
-  prescriptionName: any
+  prescriptionName: any,
+  language: PnLanguage = "en"
 ): string {
   const medName = capitalizeFirstLetter(prescriptionName);
+
+  if (language === "es") {
+    switch (notificationCount) {
+      case 1:
+        return `La dosis de ${medName} para ${childName} está pendiente. Pulsa para dar la dosis.`;
+      case 2:
+        return `La dosis de ${medName} para ${childName} está pendiente. Pulsa para dar la dosis.`;
+      case 3:
+        return `La dosis de ${medName} para ${childName} está pendiente. Pulsa para dar la dosis.`;
+      case 4:
+        return `Se omitió la dosis de ${medName} para ${childName}. Ingresa al programa para ver o editar.`;
+      default:
+        return `${childName} puede recibir la siguiente dosis de ${medName} ahora.`;
+    }
+  }
 
   switch (notificationCount) {
     case 1:
@@ -1004,17 +1093,23 @@ function updateEventNotificationCount(
       nextNotificationTime =
         currentTime + (event.snoozeInterval || 15) * 60 * 1000;
       break;
+    default:
+      // Normalize missing/unknown counts to first reminder timing
+      event.notificationCount = 1;
+      nextNotificationTime =
+        currentTime + (event.snoozeInterval || 10) * 60 * 1000;
+      break;
   }
   const newNotificationCount = event.notificationCount + 1;
 
   const updates =
     newNotificationCount === 5
       ? {
-          state: "paused",
-          nextNotificationTime: null,
-          notificationCount: null,
-          snoozeInterval: null,
-        }
+        state: "paused",
+        nextNotificationTime: null,
+        notificationCount: null,
+        snoozeInterval: null,
+      }
       : { nextNotificationTime, notificationCount: newNotificationCount };
 
   return db.ref(`events/${eventId}`).update(updates);
@@ -1047,8 +1142,11 @@ export async function updatePrescriptionEventNotificationCount(
         currentTime + (event.snoozeInterval || 15) * 60 * 1000;
       break;
     default:
-      // If somehow 0/undefined/≥5 arrives, just no-op the snooze calculation.
-      nextNotificationTime = undefined;
+      // Normalize missing/unknown counts to first reminder timing
+      event.notificationCount = 1;
+      nextNotificationTime =
+        currentTime + (event.snoozeInterval || 10) * 60 * 1000;
+      break;
   }
 
   const newNotificationCount = (Number(event.notificationCount) || 0) + 1;
@@ -1123,7 +1221,11 @@ const fetchCareFamilyMembers = async (parentId: string, childId: string) => {
           if (!uSnap.exists()) return null;
           const uVal = uSnap.val() || {};
           if (!uVal.allowsPushNotifications) return null;
-          return { uid: uSnap.key as string, allowsPushNotifications: true };
+          return {
+            uid: uSnap.key as string,
+            allowsPushNotifications: true,
+            pnLanguage: getPnLanguage(uVal),
+          };
         })
       )
     );
@@ -1131,6 +1233,7 @@ const fetchCareFamilyMembers = async (parentId: string, childId: string) => {
     return userReads.filter(Boolean) as Array<{
       uid: string;
       allowsPushNotifications: true;
+      pnLanguage?: PnLanguage;
     }>;
   } catch (error) {
     logger.error("Error fetching care family members:", error);
@@ -1141,35 +1244,35 @@ const fetchCareFamilyMembers = async (parentId: string, childId: string) => {
 function getChild(childId) {
   return !childId
     ? Promise.reject(
-        new Error(
-          `Cannot locate child. An invalid childId was given - childId was undefined.`
-        )
+      new Error(
+        `Cannot locate child. An invalid childId was given - childId was undefined.`
       )
+    )
     : db
-        .ref(`/children/${childId}`)
-        .once("value")
-        .then((userSnapshot) => {
-          return userSnapshot.exists()
-            ? Object.assign({}, userSnapshot.val(), { id: userSnapshot.key })
-            : undefined;
-        });
+      .ref(`/children/${childId}`)
+      .once("value")
+      .then((userSnapshot) => {
+        return userSnapshot.exists()
+          ? Object.assign({}, userSnapshot.val(), { id: userSnapshot.key })
+          : undefined;
+      });
 }
 
 function getUser(userId) {
   return !userId
     ? Promise.reject(
-        new Error(
-          `Cannot locate user. An invalid userId was given - userId was undefined.`
-        )
+      new Error(
+        `Cannot locate user. An invalid userId was given - userId was undefined.`
       )
+    )
     : db
-        .ref(`/users/${userId}`)
-        .once("value")
-        .then((userSnapshot) => {
-          return userSnapshot.exists()
-            ? Object.assign({}, userSnapshot.val(), { id: userSnapshot.key })
-            : undefined;
-        });
+      .ref(`/users/${userId}`)
+      .once("value")
+      .then((userSnapshot) => {
+        return userSnapshot.exists()
+          ? Object.assign({}, userSnapshot.val(), { id: userSnapshot.key })
+          : undefined;
+      });
 }
 
 async function sendPushNotificationsToUser(
@@ -2083,12 +2186,18 @@ const sendPushAfterInviteAccept = async (parentId: string, userName) => {
         logger.log(`No pushToken for parent with ID ${parent.uid}`);
       }
 
+      const language = getPnLanguage(parent);
+      const message =
+        language === "es"
+          ? `${userName} aceptó tu invitación, y se unió a la familia encargada. Puedes completar la configuración en la pestaña de Familia Encargada.`
+          : `${userName} has accepted your invitation, and joined the care family. You can now complete the setup in the Care Family tab.`;
+
       return sendPushNotificationsToUser(
         parent.uid,
-        `${userName} has accepted your invitation, and joined the care family. You can now complete the setup in the Care Family tab.`,
+        message,
         { screen: "Caregivers" }
       )
-        .then(() => {})
+        .then(() => { })
         .catch((error) => {
           logger.error(
             "Error sending care family invitation Push Notification",
@@ -2433,7 +2542,7 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
       if (!Number.isNaN(expiryMs) && expiryMs > now) {
         logger.log(
           `Early-returning cached iOS subscription for user ${userId}. ` +
-            `Expiry: ${purchaseInfo.subscriptionExpiry}`
+          `Expiry: ${purchaseInfo.subscriptionExpiry}`
         );
 
         return {
@@ -2884,7 +2993,7 @@ export async function migrateCaregiversForUser(
   userId: string
 ): Promise<Record<string, any>> {
   // 1) Gather all matching caregivers in one array
-  const allCaregiversArray: Array<{ id: string; [k: string]: any }> = [];
+  const allCaregiversArray: Array<{ id: string;[k: string]: any }> = [];
 
   // A) Query for caregiver_id == userId
   const caregiverSnap = await onCureDb
@@ -3715,8 +3824,8 @@ function transformEventAndDoses(
       oldEvent.cycle === "both"
         ? "alternating"
         : oldEvent.cycle === "ibprofen"
-        ? "ibuprofen"
-        : oldEvent.cycle,
+          ? "ibuprofen"
+          : oldEvent.cycle,
     dosageType: {},
     dosageGiven: [], // we fill below
     eventId: eventId,
