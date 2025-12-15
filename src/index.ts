@@ -994,13 +994,34 @@ const getPnLanguage = (user?: { pnLanguage?: string }): PnLanguage => {
   return lang === "es" ? "es" : "en";
 };
 
+const cycleTranslations: Record<PnLanguage, Record<string, string>> = {
+  en: {
+    acetaminophen: "Acetaminophen",
+    ibuprofen: "Ibuprofen",
+    alternating: "Alternating",
+  },
+  es: {
+    acetaminophen: "Paracetamol",
+    ibuprofen: "Ibuprofeno",
+    alternating: "Alternar",
+  },
+};
+
+const translateCycleName = (
+  cycle: string,
+  language: PnLanguage
+): string => {
+  const normalized = cycle?.toLowerCase?.() ?? "";
+  return cycleTranslations[language]?.[normalized] ?? cycle ?? "";
+};
+
 function getNotificationMessage(
   child: any,
   event: any,
   language: PnLanguage = "en"
 ): string {
   const notificationCount = event.notificationCount;
-  const cycle = capitalizeFirstLetter(event.cycle);
+  const cycle = translateCycleName(event.cycle, language);
   const childName = child.childName;
 
   if (language === "es") {
