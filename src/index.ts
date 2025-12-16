@@ -336,7 +336,7 @@ export const checkEventDoses = async () => {
         try {
           if (child) {
             const parentLanguage = getPnLanguage(parent);
-            const cycle = capitalizeFirstLetter(event.cycle);
+            const cycle = translateCycleName(event.cycle, parentLanguage);
             notificationBody =
               parentLanguage === "es"
                 ? `${child.childName} puede recibir la siguiente dosis de ${cycle} ahora. Pulsa aquí para administrar la dosis.`
@@ -381,7 +381,7 @@ export const checkEventDoses = async () => {
                 const memberLanguage = getPnLanguage({
                   pnLanguage: member.pnLanguage,
                 });
-                const cycle = capitalizeFirstLetter(event.cycle);
+                const cycle = translateCycleName(event.cycle, memberLanguage);
                 const memberBody =
                   memberLanguage === "es"
                     ? `${child.childName} puede recibir la siguiente dosis de ${cycle} ahora. Pulsa aquí para administrar la dosis.`
