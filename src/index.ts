@@ -2447,10 +2447,44 @@ function hasAppleLifetimePurchase(validationResponse: any, productId?: string): 
   }
 
   if (productId) {
-    return inAppPurchases.some((p) => p?.product_id === productId);
+    // If caller provided a known lifetime SKU, require an exact match.
+    // If caller provided a subscription SKU (common on restore), fall back to
+    // scanning all in-app purchases for any lifetime SKU.
+    if (isLikelyLifetimeProductId(productId)) {
+      return inAppPurchases.some(
+        (p) =>
+          p?.product_id === productId && isLikelyLifetimeProductId(p?.product_id)
+      );
+    }
   }
 
   return inAppPurchases.some((p) => isLikelyLifetimeProductId(p?.product_id));
+}
+
+function getAppleLifetimeProductId(
+  validationResponse: any,
+  preferredProductId?: string
+): string | null {
+  const inAppPurchases = validationResponse?.receipt?.in_app || [];
+  if (!Array.isArray(inAppPurchases) || inAppPurchases.length === 0) {
+    return null;
+  }
+
+  if (preferredProductId && isLikelyLifetimeProductId(preferredProductId)) {
+    const matched = inAppPurchases.find(
+      (p) =>
+        p?.product_id === preferredProductId &&
+        isLikelyLifetimeProductId(p?.product_id)
+    );
+    if (matched?.product_id) {
+      return matched.product_id;
+    }
+  }
+
+  const firstLifetime = inAppPurchases.find((p) =>
+    isLikelyLifetimeProductId(p?.product_id)
+  );
+  return firstLifetime?.product_id || null;
 }
 
 function isGoogleSubscriptionPurchase(
@@ -2672,7 +2706,12 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
       | undefined;
 
     // Lifetime entitlement is permanent unless explicitly revoked.
-    if (userData?.subscribed === true && storedEntitlementType === "lifetime") {
+    if (
+      userData?.subscribed === true &&
+      storedEntitlementType === "lifetime" &&
+      storedPurchaseType === "iap" &&
+      isLikelyLifetimeProductId(purchaseInfo?.productId)
+    ) {
       return {
         subscribed: true,
         subscriptionExpiry: null,
@@ -2776,13 +2815,21 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
           updatedPurchaseInfo.subscriptionExpiry = subscriptionExpiry;
           updatedPurchaseInfo.transactionReceipt =
             validationResponse.latest_receipt;
+          updatedPurchaseInfo.productId = activeSubscription.product_id;
           updatedPurchaseInfo.entitlementType = "subscription";
           updatedPurchaseInfo.purchaseType = "subs";
         } else if (
           hasAppleLifetimePurchase(validationResponse, purchaseInfo?.productId)
         ) {
+          const lifetimeProductId = getAppleLifetimeProductId(
+            validationResponse,
+            purchaseInfo?.productId
+          );
           isSubscribed = true;
           subscriptionExpiry = null;
+          if (lifetimeProductId) {
+            updatedPurchaseInfo.productId = lifetimeProductId;
+          }
           updatedPurchaseInfo.entitlementType = "lifetime";
           updatedPurchaseInfo.purchaseType = "iap";
         }
