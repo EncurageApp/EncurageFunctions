@@ -2419,6 +2419,38 @@ function inferPurchaseType(productId?: string | null): PurchaseType {
   return isLikelyLifetimeProductId(productId) ? "iap" : "subs";
 }
 
+function normalizeEntitlementState(params: {
+  productId?: string | null;
+  entitlementType?: EntitlementType;
+  purchaseType?: PurchaseType;
+}) {
+  const isLifetimeSku = isLikelyLifetimeProductId(params.productId);
+
+  let entitlementType: EntitlementType =
+    params.entitlementType || (isLifetimeSku ? "lifetime" : "subscription");
+  let purchaseType: PurchaseType =
+    params.purchaseType || (entitlementType === "lifetime" ? "iap" : "subs");
+
+  if (entitlementType === "lifetime" && !isLifetimeSku) {
+    entitlementType = "subscription";
+    purchaseType = "subs";
+  } else if (entitlementType === "subscription" && isLifetimeSku) {
+    entitlementType = "lifetime";
+    purchaseType = "iap";
+  }
+
+  if (entitlementType === "lifetime" && purchaseType !== "iap") {
+    purchaseType = "iap";
+  } else if (entitlementType === "subscription" && purchaseType !== "subs") {
+    purchaseType = "subs";
+  }
+
+  return {
+    entitlementType,
+    purchaseType,
+  };
+}
+
 function parseAndroidReceipt(receipt: unknown): any {
   if (typeof receipt === "string") {
     try {
@@ -2503,7 +2535,8 @@ function isGoogleSubscriptionPurchase(
  * @returns {Promise<Object>} Validation result.
  */
 exports.validatePurchase = v1.https.onCall(async (data, context) => {
-  const { platform, receipt, packageName, productId, purchaseType } = data;
+  const { platform, receipt, packageName, productId, basePlanId, purchaseType } =
+    data;
 
   // Ensure the user is authenticated
   if (!context.auth) {
@@ -2531,6 +2564,7 @@ exports.validatePurchase = v1.https.onCall(async (data, context) => {
       receipt,
       packageName,
       productId,
+      basePlanId,
       purchaseType,
     });
 
@@ -2550,25 +2584,35 @@ exports.validatePurchase = v1.https.onCall(async (data, context) => {
         now
       );
       const hasLifetime = hasAppleLifetimePurchase(validationResponse, productId);
+      const lifetimeProductId = hasLifetime
+        ? getAppleLifetimeProductId(validationResponse, productId)
+        : null;
+      const resolvedProductId =
+        lifetimeProductId || activeSubscription?.product_id || productId;
+      // const resolvedBasePlanId = basePlanId || resolvedProductId || null;
 
       const subscriptionExpiry = activeSubscription
         ? new Date(parseInt(activeSubscription.expires_date_ms, 10))
         : null;
-      const entitlementType: EntitlementType = hasLifetime
-        ? "lifetime"
-        : "subscription";
-      const entitlementActive = hasLifetime || !!activeSubscription;
-      const normalizedPurchaseType: PurchaseType =
-        purchaseType || (hasLifetime ? "iap" : "subs");
+      const normalizedEntitlement = normalizeEntitlementState({
+        productId: resolvedProductId,
+        entitlementType: hasLifetime ? "lifetime" : "subscription",
+        purchaseType: purchaseType || (hasLifetime ? "iap" : "subs"),
+      });
+      const entitlementActive =
+        normalizedEntitlement.entitlementType === "lifetime"
+          ? !!resolvedProductId && isLikelyLifetimeProductId(resolvedProductId)
+          : !!activeSubscription;
 
       // Update subscription status in the database
       await db.ref(`/users/${userId}`).update({
         purchaseInfo: {
           subscriptionExpiry: subscriptionExpiry?.toISOString() || null,
-          productId,
+          productId: resolvedProductId,
+          // basePlanId: resolvedBasePlanId,
           transactionReceipt: receipt, // For Apple
-          purchaseType: normalizedPurchaseType,
-          entitlementType,
+          purchaseType: normalizedEntitlement.purchaseType,
+          entitlementType: normalizedEntitlement.entitlementType,
           platform: "ios",
         },
         subscribed: entitlementActive, // true if an entitlement is active
@@ -2582,12 +2626,16 @@ exports.validatePurchase = v1.https.onCall(async (data, context) => {
         latestReceiptInfo: validationResponse.latest_receipt_info[0], // Pass other info if needed
         subscriptionStatus: entitlementActive, // Backward-compatible field name
         entitlementActive,
-        entitlementType,
-        purchaseType: normalizedPurchaseType,
+        entitlementType: normalizedEntitlement.entitlementType,
+        purchaseType: normalizedEntitlement.purchaseType,
+        // basePlanId: resolvedBasePlanId,
       };
     } else if (platform === "android") {
       // Google Play Receipt Validation
       const parsedReceipt = parseAndroidReceipt(receipt);
+      const existingPurchaseInfo = (
+        await db.ref(`/users/${userId}/purchaseInfo`).once("value")
+      ).val();
       const purchaseToken =
         parsedReceipt.purchaseToken ||
         parsedReceipt.token ||
@@ -2595,7 +2643,7 @@ exports.validatePurchase = v1.https.onCall(async (data, context) => {
       const packageNameToUse =
         packageName || parsedReceipt.packageName || DEFAULT_ANDROID_PACKAGE_NAME;
       const productIdToUse = productId || parsedReceipt.productId;
-      const normalizedPurchaseType: PurchaseType =
+      const requestedPurchaseType: PurchaseType =
         purchaseType || inferPurchaseType(productIdToUse);
 
       if (!purchaseToken || !productIdToUse) {
@@ -2603,41 +2651,49 @@ exports.validatePurchase = v1.https.onCall(async (data, context) => {
       }
 
       validationResponse =
-        normalizedPurchaseType === "iap"
+        requestedPurchaseType === "iap"
           ? await validateGoogleProductReceipt(
-              purchaseToken,
-              packageNameToUse,
-              productIdToUse
-            )
+            purchaseToken,
+            packageNameToUse,
+            productIdToUse
+          )
           : await validateGoogleSubscriptionReceipt(
-              purchaseToken,
-              packageNameToUse,
-              productIdToUse
-            );
+            purchaseToken,
+            packageNameToUse,
+            productIdToUse
+          );
 
       logger.log("Google Validation Response:", validationResponse);
 
       const subscriptionExpiry =
-        normalizedPurchaseType === "subs" &&
-        isGoogleSubscriptionPurchase(validationResponse)
+        requestedPurchaseType === "subs" &&
+          isGoogleSubscriptionPurchase(validationResponse)
           ? new Date(parseInt(validationResponse.expiryTimeMillis, 10))
-          : null;
+          : existingPurchaseInfo?.subscriptionExpiry
+            ? new Date(existingPurchaseInfo.subscriptionExpiry)
+            : null;
+      const normalizedEntitlement = normalizeEntitlementState({
+        productId: productIdToUse,
+        entitlementType: requestedPurchaseType === "iap" ? "lifetime" : "subscription",
+        purchaseType: requestedPurchaseType,
+      });
+      const resolvedBasePlanId =
+        basePlanId || validationResponse?.basePlanId || productIdToUse;
       const entitlementActive =
-        normalizedPurchaseType === "iap"
+        normalizedEntitlement.entitlementType === "lifetime"
           ? validationResponse?.purchaseState === 0
           : subscriptionExpiry
             ? subscriptionExpiry.getTime() > now
             : false;
-      const entitlementType: EntitlementType =
-        normalizedPurchaseType === "iap" ? "lifetime" : "subscription";
 
       await db.ref(`/users/${userId}`).update({
         purchaseInfo: {
           subscriptionExpiry: subscriptionExpiry?.toISOString() || null,
           productId: productIdToUse,
+          basePlanId: resolvedBasePlanId || null,
           purchaseToken: purchaseToken, // For Google
-          purchaseType: normalizedPurchaseType,
-          entitlementType,
+          purchaseType: normalizedEntitlement.purchaseType,
+          entitlementType: normalizedEntitlement.entitlementType,
           platform: "android",
         },
         subscribed: entitlementActive,
@@ -2650,9 +2706,10 @@ exports.validatePurchase = v1.https.onCall(async (data, context) => {
         rawPurchaseState: validationResponse.purchaseState,
         orderId: validationResponse.orderId, // Additional info if needed
         subscriptionStatus: entitlementActive, // Backward-compatible field name
+        basePlanId: resolvedBasePlanId || null,
         entitlementActive,
-        entitlementType,
-        purchaseType: normalizedPurchaseType,
+        entitlementType: normalizedEntitlement.entitlementType,
+        purchaseType: normalizedEntitlement.purchaseType,
       };
     } else {
       throw new v1.https.HttpsError(
@@ -2692,7 +2749,7 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
     if (userData?.legacySubscription === true) {
       return {
         subscribed: "legacySubscription",
-        subscriptionExpiry: userData?.subscriptionExpiry,
+        subscriptionExpiry: userData?.subscriptionExpiry, // needed for when we remove legacySubscription
       };
     }
 
@@ -2714,7 +2771,7 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
     ) {
       return {
         subscribed: true,
-        subscriptionExpiry: null,
+        subscriptionExpiry: purchaseInfo?.subscriptionExpiry || null,
       };
     }
 
@@ -2845,29 +2902,42 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
     else if (purchaseInfo?.purchaseToken) {
       logger.log("Validating with Google...");
       const productIdToUse = purchaseInfo.productId;
+      const inferredPurchaseType = inferPurchaseType(productIdToUse);
       const purchaseTypeToUse =
-        storedPurchaseType || inferPurchaseType(productIdToUse);
+        storedPurchaseType &&
+          ((storedPurchaseType === "iap" &&
+            isLikelyLifetimeProductId(productIdToUse)) ||
+            (storedPurchaseType === "subs" &&
+              !isLikelyLifetimeProductId(productIdToUse)))
+          ? storedPurchaseType
+          : inferredPurchaseType;
 
       validationResponse =
         purchaseTypeToUse === "iap"
           ? await validateGoogleProductReceipt(
-              purchaseInfo.purchaseToken,
-              DEFAULT_ANDROID_PACKAGE_NAME,
-              productIdToUse
-            )
+            purchaseInfo.purchaseToken,
+            DEFAULT_ANDROID_PACKAGE_NAME,
+            productIdToUse
+          )
           : await validateGoogleSubscriptionReceipt(
-              purchaseInfo.purchaseToken,
-              DEFAULT_ANDROID_PACKAGE_NAME,
-              productIdToUse
-            );
+            purchaseInfo.purchaseToken,
+            DEFAULT_ANDROID_PACKAGE_NAME,
+            productIdToUse
+          );
 
-      logger.log("Google validation response:", validationResponse);
+      logger.log("Google validation response:", validationResponse, productIdToUse);
+      const resolvedBasePlanId =
+        validationResponse?.basePlanId || purchaseInfo?.basePlanId || productIdToUse;
 
       if (purchaseTypeToUse === "iap") {
         isSubscribed = validationResponse?.purchaseState === 0;
-        subscriptionExpiry = null;
+        subscriptionExpiry =
+          typeof updatedPurchaseInfo.subscriptionExpiry === "string"
+            ? updatedPurchaseInfo.subscriptionExpiry
+            : null;
         updatedPurchaseInfo.entitlementType = "lifetime";
         updatedPurchaseInfo.purchaseType = "iap";
+        updatedPurchaseInfo.basePlanId = null;
       } else if (isGoogleSubscriptionPurchase(validationResponse)) {
         const expiryMillis = parseInt(validationResponse.expiryTimeMillis, 10);
         const priceAmountMicros = parseInt(
@@ -2895,6 +2965,7 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
         }
         updatedPurchaseInfo.entitlementType = "subscription";
         updatedPurchaseInfo.purchaseType = "subs";
+        updatedPurchaseInfo.basePlanId = resolvedBasePlanId || null;
       } else {
         logger.warn("Google receipt validation failed.");
       }
@@ -2903,6 +2974,33 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
     }
 
     // Update the subscription status and purchaseInfo
+    if (
+      updatedPurchaseInfo?.productId ||
+      updatedPurchaseInfo?.entitlementType ||
+      updatedPurchaseInfo?.purchaseType
+    ) {
+      const normalizedEntitlement = normalizeEntitlementState({
+        productId: updatedPurchaseInfo.productId,
+        entitlementType: updatedPurchaseInfo.entitlementType,
+        purchaseType: updatedPurchaseInfo.purchaseType,
+      });
+      updatedPurchaseInfo.entitlementType = normalizedEntitlement.entitlementType;
+      updatedPurchaseInfo.purchaseType = normalizedEntitlement.purchaseType;
+
+      if (
+        normalizedEntitlement.entitlementType === "subscription" &&
+        !updatedPurchaseInfo.subscriptionExpiry
+      ) {
+        isSubscribed = false;
+      }
+      if (
+        normalizedEntitlement.entitlementType === "lifetime" &&
+        !isLikelyLifetimeProductId(updatedPurchaseInfo.productId)
+      ) {
+        isSubscribed = false;
+      }
+    }
+
     await userRef.update({
       subscribed: isSubscribed,
       purchaseInfo: updatedPurchaseInfo,
@@ -2958,6 +3056,8 @@ async function validateAppleReceipt(receipt) {
 
 /**
  * Validates a Google Play subscription receipt.
+ * Uses subscriptionsv2 for plan-level details (including basePlanId), with legacy
+ * subscription lookup as a fallback for compatibility with existing entitlement logic.
  * @param {string} purchaseToken - The purchase token from the client.
  * @param {string} packageName - The app package name.
  * @param {string} productId - The product ID of the subscription.
@@ -2974,17 +3074,69 @@ async function validateGoogleSubscriptionReceipt(
   });
 
   try {
-    const response = await google
+    const v2Response = await google
       .androidpublisher("v3")
-      .purchases.subscriptions.get({
+      .purchases.subscriptionsv2.get({
         packageName: packageName,
-        subscriptionId: productId,
         token: purchaseToken,
         auth: auth,
       });
 
+    // Optional legacy fallback for validation details not present in v2 response.
+    let legacyResponse: any = null;
+    try {
+      const legacy = await google
+        .androidpublisher("v3")
+        .purchases.subscriptions.get({
+          packageName: packageName,
+          subscriptionId: productId,
+          token: purchaseToken,
+          auth: auth,
+        });
+      legacyResponse = legacy.data;
+    } catch (legacyError) {
+      logger.warn("Legacy Google subscription validation failed:", legacyError);
+    }
+
+    const v2Data: any = v2Response.data || {};
+    const legacyData: any = legacyResponse || {};
+    const data: any = { ...legacyData, ...v2Data };
+    const lineItem: any = v2Response.data?.lineItems?.[0] || null;
+    const basePlanId =
+      lineItem?.offerDetails?.basePlanId ??
+      lineItem?.basePlanId ??
+      legacyData.basePlanId ??
+      v2Data.basePlanId ??
+      null;
+    const expiryTimeMillis = data.expiryTimeMillis
+      ? String(data.expiryTimeMillis)
+      : legacyData.expiryTimeMillis
+        ? String(legacyData.expiryTimeMillis)
+      : lineItem?.expiryTime
+        ? String(Date.parse(lineItem.expiryTime))
+        : null;
+    const v2PaymentState = () => {
+      const value =
+        lineItem?.autoRenewingPlan?.paymentState ??
+        lineItem?.acknowledgementState ??
+        null;
+      if (value === "PENDING" || value === 0) return 0;
+      return value === "PAID" || value === 1 ? 1 : data.paymentState ?? 1;
+    };
+
+    const enrichedData = {
+      ...data,
+      basePlanId,
+      expiryTimeMillis: expiryTimeMillis || data.expiryTimeMillis,
+      paymentState: v2PaymentState(),
+      priceAmountMicros:
+        data.priceAmountMicros || lineItem?.priceAmountMicros || legacyData.priceAmountMicros,
+      orderId: data.orderId || legacyData.orderId,
+      purchaseState: data.purchaseState || legacyData.purchaseState,
+    };
+
     // Step 2: Check acknowledgment status
-    if (response.data?.acknowledgementState === 0) {
+    if (data?.acknowledgementState === 0 || lineItem?.acknowledgementState === 0) {
       // Acknowledge the purchase if not already acknowledged
       const acknowledge = await google
         .androidpublisher("v3")
@@ -2996,13 +3148,13 @@ async function validateGoogleSubscriptionReceipt(
         });
 
       logger.log("acknowledge", acknowledge);
-      logger.log(
-        "Purchase acknowledged successfully for token:",
-        purchaseToken
-      );
+      logger.log("Purchase acknowledged successfully for token:", purchaseToken);
     }
-    logger.log("validateGoogleSubscriptionReceipt response", response);
-    return response.data;
+    logger.log(
+      "validateGoogleSubscriptionReceipt v2 response",
+      v2Response.data
+    );
+    return enrichedData;
   } catch (error) {
     logger.error("Google subscription receipt validation failed:", error);
     throw error;
