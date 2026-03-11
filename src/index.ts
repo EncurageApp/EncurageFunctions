@@ -70,9 +70,6 @@ const db = admin.app().database();
 // const onCureDb = admin.app("onCureApp").database();
 const onCureDb = getOnCureDb();
 
-// Start writing functions
-// https://firebase.google.com/docs/functions/typescript
-
 /*
 export const newChildAdded = v1.database
   .ref("children/{childId}")
@@ -763,129 +760,6 @@ export const processPrescriptionNextNotificationTime = async () => {
   const totalEvents = snap.numChildren();
   if (totalEvents === 0) return;
 
-  // 2) collect events into array
-  // snap.forEach((childSnapshot) => {
-  //   const event = childSnapshot.val();
-  //   const eventId = childSnapshot.key;
-
-  //   if (
-  //     event.state === "active" &&
-  //     event.nextNotificationTime &&
-  //     event.notificationCount <= 5
-  //   ) {
-  //     const promise = (async () => {
-  //       let child: any;
-  //       let parent: any;
-  //       let notificationBody = "";
-
-  //       // 1) Get child data
-  //       try {
-  //         child = await getChild(event.childId);
-  //         if (!child) {
-  //           throw new Error(`Child not found for ID ${event.childId}`);
-  //         }
-  //       } catch (error) {
-  //         logger.error(`Error fetching child for event ${eventId}:`, error);
-  //       }
-
-  //       // 2) Get parent data
-  //       try {
-  //         if (child) {
-  //           parent = await getUser(child.parentId);
-  //           if (!parent) {
-  //             throw new Error(`Parent not found for ID ${child.parentId}`);
-  //           }
-  //         }
-  //       } catch (error) {
-  //         logger.error(`Error fetching parent for event ${eventId}:`, error);
-  //       }
-
-  //       // 3) fetch prescription
-  //       const prescription = await getPrescription(event.prescriptionId);
-  //       if (!prescription)
-  //         throw new Error(`Prescription not found: ${event.prescriptionId}`);
-
-  //       // 4) build notifications
-  //       notificationBody = prescriptionNotification(
-  //         child.childName,
-  //         event.notificationCount,
-  //         prescription.name
-  //       );
-
-  //       // 4) Send notification to parent if allowed
-  //       try {
-  //         if (parent && parent.allowsPushNotifications && notificationBody) {
-  //           await sendPushNotificationsToUser(parent.uid, notificationBody, {
-  //             childId: event.childId,
-  //             eventId: eventId,
-  //             screen: "PrimarySchedule",
-  //           });
-  //         }
-  //       } catch (error) {
-  //         logger.error(
-  //           `Error sending notification to parent ${
-  //             parent ? parent.uid : "unknown"
-  //           } for event ${eventId}:`,
-  //           error
-  //         );
-  //       }
-
-  //       // 5) Send notifications to eligible care team members
-  //       try {
-  //         if (child) {
-  //           const careFamilyMembers = await fetchCareFamilyMembers(
-  //             child.parentId,
-  //             event.childId
-  //           );
-  //           const eligibleMembers = careFamilyMembers.filter(
-  //             (member) => member.allowsPushNotifications
-  //           );
-  //           const memberResults = await Promise.allSettled(
-  //             eligibleMembers.map((member) =>
-  //               sendPushNotificationsToUser(member.uid, notificationBody, {
-  //                 childId: event.childId,
-  //                 eventId: eventId,
-  //                 screen: "PrimarySchedule",
-  //               })
-  //             )
-  //           );
-  //           memberResults.forEach((result) => {
-  //             if (result.status === "rejected") {
-  //               logger.error(
-  //                 `Error sending notification to care team member for event ${eventId}:`,
-  //                 result.reason
-  //               );
-  //             }
-  //           });
-  //         }
-  //       } catch (error) {
-  //         logger.error(
-  //           `Error processing care team notifications for event ${eventId}:`,
-  //           error
-  //         );
-  //       }
-
-  //       // 6) update DB
-  //       try {
-  //         return await updatePrescriptionEventNotificationCount(
-  //           event,
-  //           eventId,
-  //           now,
-  //           prescription,
-  //           parent.timeZone ?? "UTC"
-  //         );
-  //       } catch (updateError) {
-  //         logger.error(
-  //           `Error updating event ${eventId} in processPrescriptionNextNotificationTime:`,
-  //           updateError
-  //         );
-  //       }
-
-  //       logger.log(`✅ Updated event ${eventId}`);
-  //     })();
-  //     promises.push(promise);
-  //   }
-  // });
 
   snap.forEach((childSnapshot) => {
     const event = childSnapshot.val();
@@ -923,19 +797,27 @@ export const processPrescriptionNextNotificationTime = async () => {
             parentLanguage
           );
 
-          if (parent.allowsPushNotifications) {
-            await sendPushNotificationsToUser(parent.uid, body, {
-              childId: event.childId,
-              eventId,
-              screen: "PrimarySchedule",
-            });
+          try {
+            if (parent.allowsPushNotifications) {
+              await sendPushNotificationsToUser(parent.uid, body, {
+                childId: event.childId,
+                eventId,
+                screen: "PrimarySchedule",
+              });
+            }
+          } catch (error) {
+            logger.error(
+              `Error sending prescription notification to parent ${parent ? parent.uid : "unknown"
+              } for event ${eventId}:`,
+              error
+            );
           }
 
           const careFamilyMembers = await fetchCareFamilyMembers(
             child.parentId,
             event.childId
           );
-          await Promise.allSettled(
+          const memberResults = await Promise.allSettled(
             careFamilyMembers
               .filter((m) => m.allowsPushNotifications)
               .map((m) => {
@@ -955,6 +837,14 @@ export const processPrescriptionNextNotificationTime = async () => {
                 });
               })
           );
+          memberResults.forEach((result) => {
+            if (result.status === "rejected") {
+              logger.error(
+                `Error sending prescription notification to care team member for event ${eventId}:`,
+                result.reason
+              );
+            }
+          });
 
           await updatePrescriptionEventNotificationCount(
             event,
@@ -2408,6 +2298,16 @@ type GoogleSubscriptionPurchase = Awaited<
 type GooglePurchaseValidationResponse =
   | GoogleProductPurchase
   | GoogleSubscriptionPurchase;
+type VoidedPurchaseLookupResult = {
+  voided: boolean;
+  voidedPurchase?: {
+    orderId?: string | null;
+    purchaseToken?: string | null;
+    voidedReason?: string | null;
+    voidedSource?: string | null;
+    voidedTimeMillis?: string | null;
+  };
+};
 
 function isLikelyLifetimeProductId(productId?: string | null): boolean {
   if (!productId) return false;
@@ -2465,8 +2365,15 @@ function parseAndroidReceipt(receipt: unknown): any {
   return {};
 }
 
+function isAppleTransactionRevoked(transaction: any): boolean {
+  return Boolean(transaction?.cancellation_date);
+}
+
 function hasActiveAppleSubscription(latestReceiptInfo: any[], now: number): any {
   return latestReceiptInfo.find((info) => {
+    if (isAppleTransactionRevoked(info)) {
+      return false;
+    }
     const expiresMs = parseInt(info?.expires_date_ms, 10);
     return !Number.isNaN(expiresMs) && expiresMs > now;
   });
@@ -2485,12 +2392,15 @@ function hasAppleLifetimePurchase(validationResponse: any, productId?: string): 
     if (isLikelyLifetimeProductId(productId)) {
       return inAppPurchases.some(
         (p) =>
+          !isAppleTransactionRevoked(p) &&
           p?.product_id === productId && isLikelyLifetimeProductId(p?.product_id)
       );
     }
   }
 
-  return inAppPurchases.some((p) => isLikelyLifetimeProductId(p?.product_id));
+  return inAppPurchases.some(
+    (p) => !isAppleTransactionRevoked(p) && isLikelyLifetimeProductId(p?.product_id)
+  );
 }
 
 function getAppleLifetimeProductId(
@@ -2505,6 +2415,7 @@ function getAppleLifetimeProductId(
   if (preferredProductId && isLikelyLifetimeProductId(preferredProductId)) {
     const matched = inAppPurchases.find(
       (p) =>
+        !isAppleTransactionRevoked(p) &&
         p?.product_id === preferredProductId &&
         isLikelyLifetimeProductId(p?.product_id)
     );
@@ -2513,8 +2424,10 @@ function getAppleLifetimeProductId(
     }
   }
 
-  const firstLifetime = inAppPurchases.find((p) =>
-    isLikelyLifetimeProductId(p?.product_id)
+  const firstLifetime = inAppPurchases.find(
+    (p) =>
+      !isAppleTransactionRevoked(p) &&
+      isLikelyLifetimeProductId(p?.product_id)
   );
   return firstLifetime?.product_id || null;
 }
@@ -2527,6 +2440,89 @@ function isGoogleSubscriptionPurchase(
     "expiryTimeMillis" in purchase &&
     typeof purchase.expiryTimeMillis === "string"
   );
+}
+
+function createGooglePublisherAuth() {
+  return new google.auth.GoogleAuth({
+    keyFile: "encurage-new-18b38f50569d.json",
+    scopes: ["https://www.googleapis.com/auth/androidpublisher"],
+  });
+}
+
+async function getVoidedGooglePurchase(
+  auth: InstanceType<typeof google.auth.GoogleAuth>,
+  packageName: string,
+  matchers: { orderId?: string | null; purchaseToken?: string | null }
+): Promise<VoidedPurchaseLookupResult> {
+  if (!matchers.orderId && !matchers.purchaseToken) {
+    return { voided: false };
+  }
+
+  const voidedPurchasesResource: any = (google.androidpublisher("v3")
+    .purchases as any).voidedpurchases;
+  // App open checks happen frequently, so a 14-day window is a practical balance.
+  const startTime = Date.now() - 14 * 24 * 60 * 60 * 1000;
+  let pageToken: string | undefined;
+
+  try {
+    do {
+      const response: any = await voidedPurchasesResource.list({
+        packageName,
+        auth,
+        type: 1,
+        maxResults: 1000,
+        startTime: String(startTime),
+        token: pageToken,
+      });
+
+      const voidedPurchases = response.data?.voidedPurchases || [];
+      const matchedPurchase = voidedPurchases.find((purchase) => {
+        const purchaseOrderId = purchase.orderId || null;
+        const purchaseToken = purchase.purchaseToken || null;
+
+        return (
+          (!!matchers.orderId && purchaseOrderId === matchers.orderId) ||
+          (!!matchers.purchaseToken && purchaseToken === matchers.purchaseToken)
+        );
+      });
+
+      if (matchedPurchase) {
+        logger.warn("Matched voided Google purchase", {
+          packageName,
+          orderId: matchedPurchase.orderId || matchers.orderId || null,
+          purchaseToken:
+            matchedPurchase.purchaseToken || matchers.purchaseToken || null,
+          voidedReason: matchedPurchase.voidedReason || null,
+          voidedSource: matchedPurchase.voidedSource || null,
+          voidedTimeMillis: matchedPurchase.voidedTimeMillis || null,
+        });
+
+        return {
+          voided: true,
+          voidedPurchase: {
+            orderId: matchedPurchase.orderId || null,
+            purchaseToken: matchedPurchase.purchaseToken || null,
+            voidedReason: matchedPurchase.voidedReason || null,
+            voidedSource: matchedPurchase.voidedSource || null,
+            voidedTimeMillis: matchedPurchase.voidedTimeMillis || null,
+          },
+        };
+      }
+
+      pageToken = response.data?.tokenPagination?.nextPageToken || undefined;
+    } while (pageToken);
+  } catch (error: any) {
+    logger.warn("Voided Google purchase lookup failed; skipping voided check.", {
+      packageName,
+      orderId: matchers.orderId || null,
+      purchaseToken: matchers.purchaseToken || null,
+      message: error?.message || String(error),
+      status: error?.response?.status || error?.status || null,
+    });
+    return { voided: false };
+  }
+
+  return { voided: false };
 }
 
 /**
@@ -2665,8 +2661,11 @@ exports.validatePurchase = v1.https.onCall(async (data, context) => {
 
       logger.log("Google Validation Response:", validationResponse);
 
+      const isVoidedPurchase = validationResponse?.voided === true;
+
       const subscriptionExpiry =
-        requestedPurchaseType === "subs" &&
+        !isVoidedPurchase &&
+          requestedPurchaseType === "subs" &&
           isGoogleSubscriptionPurchase(validationResponse)
           ? new Date(parseInt(validationResponse.expiryTimeMillis, 10))
           : existingPurchaseInfo?.subscriptionExpiry
@@ -2680,33 +2679,46 @@ exports.validatePurchase = v1.https.onCall(async (data, context) => {
       const resolvedBasePlanId =
         basePlanId || validationResponse?.basePlanId || productIdToUse;
       const entitlementActive =
-        normalizedEntitlement.entitlementType === "lifetime"
-          ? validationResponse?.purchaseState === 0
-          : subscriptionExpiry
-            ? subscriptionExpiry.getTime() > now
-            : false;
+        isVoidedPurchase
+          ? false
+          : normalizedEntitlement.entitlementType === "lifetime"
+            ? validationResponse?.purchaseState === 0
+            : subscriptionExpiry
+              ? subscriptionExpiry.getTime() > now
+              : false;
 
-      await db.ref(`/users/${userId}`).update({
-        purchaseInfo: {
-          subscriptionExpiry: subscriptionExpiry?.toISOString() || null,
-          productId: productIdToUse,
-          basePlanId: resolvedBasePlanId || null,
-          purchaseToken: purchaseToken, // For Google
-          purchaseType: normalizedEntitlement.purchaseType,
-          entitlementType: normalizedEntitlement.entitlementType,
-          platform: "android",
-        },
-        subscribed: entitlementActive,
-      });
+      await db.ref(`/users/${userId}`).update(
+        isVoidedPurchase
+          ? {
+            purchaseInfo: null,
+            subscribed: false,
+          }
+          : {
+            purchaseInfo: {
+              subscriptionExpiry: subscriptionExpiry?.toISOString() || null,
+              productId: productIdToUse,
+              basePlanId: resolvedBasePlanId || null,
+              purchaseToken: purchaseToken, // For Google
+              purchaseType: normalizedEntitlement.purchaseType,
+              entitlementType: normalizedEntitlement.entitlementType,
+              platform: "android",
+            },
+            subscribed: entitlementActive,
+          }
+      );
 
       return {
         // Kept for backward compatibility with existing app check.
         purchaseState: entitlementActive ? 1 : 0,
         paymentState: validationResponse.paymentState,
+        voided: validationResponse.voided,
         rawPurchaseState: validationResponse.purchaseState,
         orderId: validationResponse.orderId, // Additional info if needed
         subscriptionStatus: entitlementActive, // Backward-compatible field name
         basePlanId: resolvedBasePlanId || null,
+        voidedReason: validationResponse?.voidedReason || null,
+        voidedSource: validationResponse?.voidedSource || null,
+        voidedTimeMillis: validationResponse?.voidedTimeMillis || null,
         entitlementActive,
         entitlementType: normalizedEntitlement.entitlementType,
         purchaseType: normalizedEntitlement.purchaseType,
@@ -2755,25 +2767,9 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
 
     const now = Date.now();
     const purchaseInfo = userData?.purchaseInfo;
-    const storedEntitlementType = purchaseInfo?.entitlementType as
-      | EntitlementType
-      | undefined;
     const storedPurchaseType = purchaseInfo?.purchaseType as
       | PurchaseType
       | undefined;
-
-    // Lifetime entitlement is permanent unless explicitly revoked.
-    if (
-      userData?.subscribed === true &&
-      storedEntitlementType === "lifetime" &&
-      storedPurchaseType === "iap" &&
-      isLikelyLifetimeProductId(purchaseInfo?.productId)
-    ) {
-      return {
-        subscribed: true,
-        subscriptionExpiry: purchaseInfo?.subscriptionExpiry || null,
-      };
-    }
 
     // -------------------------------------------------
     // iOS EARLY RETURN: subscribed true + good cache
@@ -2808,6 +2804,16 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
           userData
         )}`
       );
+      logger.log("checkSubscription early return: missing receipt/token", {
+        userId,
+        subscribed: userData?.subscribed ?? null,
+        hasTransactionReceipt: !!purchaseInfo?.transactionReceipt,
+        hasPurchaseToken: !!purchaseInfo?.purchaseToken,
+      });
+      return {
+        subscribed: userData?.subscribed === true,
+        subscriptionExpiry: purchaseInfo?.subscriptionExpiry || null,
+      };
     }
 
     logger.log(
@@ -2901,6 +2907,14 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
     // ------------------
     else if (purchaseInfo?.purchaseToken) {
       logger.log("Validating with Google...");
+      logger.log("checkSubscription entering Android validation", {
+        userId,
+        productId: purchaseInfo?.productId || null,
+        purchaseToken: purchaseInfo?.purchaseToken || null,
+        storedPurchaseType: storedPurchaseType || null,
+        storedPlatform: purchaseInfo?.platform || null,
+        subscribed: userData?.subscribed ?? null,
+      });
       const productIdToUse = purchaseInfo.productId;
       const inferredPurchaseType = inferPurchaseType(productIdToUse);
       const purchaseTypeToUse =
@@ -2928,8 +2942,13 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
       logger.log("Google validation response:", validationResponse, productIdToUse);
       const resolvedBasePlanId =
         validationResponse?.basePlanId || purchaseInfo?.basePlanId || productIdToUse;
+      const isVoidedPurchase = validationResponse?.voided === true;
 
-      if (purchaseTypeToUse === "iap") {
+      if (isVoidedPurchase) {
+        isSubscribed = false;
+        subscriptionExpiry = null;
+        updatedPurchaseInfo = {};
+      } else if (purchaseTypeToUse === "iap") {
         isSubscribed = validationResponse?.purchaseState === 0;
         subscriptionExpiry =
           typeof updatedPurchaseInfo.subscriptionExpiry === "string"
@@ -2948,11 +2967,9 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
 
         if (validationResponse.paymentState === 0) {
           // Billing issue: Apply grace period
-          if (applyGracePeriod(expiryMillis, isAnnual)) {
-            isSubscribed = true;
-          }
-        } else if (validationResponse.paymentState === 1) {
-          // Payment received
+          isSubscribed = applyGracePeriod(expiryMillis, isAnnual);
+        } else {
+          // Treat any non-pending valid Google subscription as active until expiry.
           isSubscribed = expiryMillis > now;
         }
 
@@ -3003,6 +3020,12 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
 
     await userRef.update({
       subscribed: isSubscribed,
+      purchaseInfo: updatedPurchaseInfo,
+    });
+    logger.log("checkSubscription wrote user subscription state", {
+      userId,
+      isSubscribed,
+      subscriptionExpiry,
       purchaseInfo: updatedPurchaseInfo,
     });
 
@@ -3068,10 +3091,7 @@ async function validateGoogleSubscriptionReceipt(
   packageName,
   productId
 ) {
-  const auth = new google.auth.GoogleAuth({
-    keyFile: "encurage-new-18b38f50569d.json",
-    scopes: ["https://www.googleapis.com/auth/androidpublisher"],
-  });
+  const auth = createGooglePublisherAuth();
 
   try {
     const v2Response = await google
@@ -3112,9 +3132,9 @@ async function validateGoogleSubscriptionReceipt(
       ? String(data.expiryTimeMillis)
       : legacyData.expiryTimeMillis
         ? String(legacyData.expiryTimeMillis)
-      : lineItem?.expiryTime
-        ? String(Date.parse(lineItem.expiryTime))
-        : null;
+        : lineItem?.expiryTime
+          ? String(Date.parse(lineItem.expiryTime))
+          : null;
     const v2PaymentState = () => {
       const value =
         lineItem?.autoRenewingPlan?.paymentState ??
@@ -3134,6 +3154,21 @@ async function validateGoogleSubscriptionReceipt(
       orderId: data.orderId || legacyData.orderId,
       purchaseState: data.purchaseState || legacyData.purchaseState,
     };
+
+    const voidedLookup = await getVoidedGooglePurchase(auth, packageName, {
+      orderId: enrichedData.orderId || null,
+      purchaseToken,
+    });
+
+    if (voidedLookup.voided) {
+      return {
+        ...enrichedData,
+        voided: true,
+        voidedReason: voidedLookup.voidedPurchase?.voidedReason || null,
+        voidedSource: voidedLookup.voidedPurchase?.voidedSource || null,
+        voidedTimeMillis: voidedLookup.voidedPurchase?.voidedTimeMillis || null,
+      };
+    }
 
     // Step 2: Check acknowledgment status
     if (data?.acknowledgementState === 0 || lineItem?.acknowledgementState === 0) {
@@ -3169,10 +3204,7 @@ async function validateGoogleSubscriptionReceipt(
  * @returns {Promise<Object>} Validation result.
  */
 async function validateGoogleProductReceipt(purchaseToken, packageName, productId) {
-  const auth = new google.auth.GoogleAuth({
-    keyFile: "encurage-new-18b38f50569d.json",
-    scopes: ["https://www.googleapis.com/auth/androidpublisher"],
-  });
+  const auth = createGooglePublisherAuth();
 
   try {
     const response = await google.androidpublisher("v3").purchases.products.get({
@@ -3182,9 +3214,19 @@ async function validateGoogleProductReceipt(purchaseToken, packageName, productI
       auth,
     });
 
-    if (response.data?.acknowledgementState === 0) {
-      const acknowledge = await google
-        .androidpublisher("v3")
+    const voidedLookup = await getVoidedGooglePurchase(auth, packageName, {
+      orderId: response.data?.orderId || null,
+      purchaseToken,
+    });
+    const responseData = response.data as Record<string, any>;
+    const isVoidedPurchase =
+      voidedLookup.voided || responseData?.voided === true;
+    const isConsumed =
+      String(responseData?.consumptionState || "") === "1";
+
+      if (response.data?.acknowledgementState === 0) {
+        const acknowledge = await google
+          .androidpublisher("v3")
         .purchases.products.acknowledge({
           packageName,
           productId,
@@ -3200,8 +3242,42 @@ async function validateGoogleProductReceipt(purchaseToken, packageName, productI
       );
     }
 
-    logger.log("validateGoogleProductReceipt response", response);
-    return response.data;
+      if (!isConsumed) {
+        try {
+          const consume = await google
+            .androidpublisher("v3")
+            .purchases.products.consume({
+              packageName,
+            productId,
+            token: purchaseToken,
+            auth,
+          });
+
+        logger.log("consume product", consume);
+        logger.log(
+          "Product purchase consumed successfully for token:",
+          purchaseToken
+        );
+      } catch (consumeError: any) {
+        logger.warn("Product purchase consume failed:", consumeError);
+      }
+    }
+
+      logger.log("validateGoogleProductReceipt response", response);
+      return {
+        ...responseData,
+        consumptionState: responseData?.consumptionState,
+        voided: isVoidedPurchase,
+      voidedReason: isVoidedPurchase
+        ? voidedLookup.voidedPurchase?.voidedReason || null
+        : null,
+      voidedSource: isVoidedPurchase
+        ? voidedLookup.voidedPurchase?.voidedSource || null
+        : null,
+      voidedTimeMillis: isVoidedPurchase
+        ? voidedLookup.voidedPurchase?.voidedTimeMillis || null
+        : null,
+    };
   } catch (error) {
     logger.error("Google product receipt validation failed:", error);
     throw error;
