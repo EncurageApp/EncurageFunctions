@@ -9,6 +9,7 @@ import { onCall, CallableRequest } from "firebase-functions/v2/https";
 import moment from "moment-timezone";
 import axios from "axios";
 import { google } from "googleapis";
+import { getVitalInsightsPayload } from "./vitalInsights";
 
 logger.log("[startup] container code loaded at", new Date().toISOString());
 // 🔥 Log any uncaught runtime issues before container dies
@@ -22,6 +23,7 @@ process.on("unhandledRejection", (reason) => {
 export const ONCURE_SERVICE_ACCOUNT_JSON = defineSecret(
   "ONCURE_SERVICE_ACCOUNT_JSON"
 );
+export const APPSTORE_SHARED_SECRET = defineSecret("APPSTORE_SHARED_SECRET");
 
 // Default Encurage app
 if (!admin.apps.length) {
@@ -2279,7 +2281,35 @@ export const addPrescriptionAndEvent = v1.https.onCall(
     }
   }
 );
+
+export const getVitalInsights = v1.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new v1.https.HttpsError(
+      "unauthenticated",
+      "Function must be called while authenticated."
+    );
+  }
+
+  try {
+    return getVitalInsightsPayload(data);
+  } catch (error: any) {
+    if (error instanceof v1.https.HttpsError) {
+      throw error;
+    }
+
+    logger.error("getVitalInsights failed", {
+      message: error?.message,
+      stack: error?.stack,
+    });
+    throw new v1.https.HttpsError(
+      "internal",
+      error?.message || "Failed to build vital insights."
+    );
+  }
+});
+
 // ***************************************************** Start Subscription ********************************
+
 // Define endpoints for receipt validation
 const APPLE_RECEIPT_VALIDATION_URL =
   "https://buy.itunes.apple.com/verifyReceipt";
@@ -2530,7 +2560,11 @@ async function getVoidedGooglePurchase(
  * @param {Object} data - Request data from the client.
  * @returns {Promise<Object>} Validation result.
  */
-exports.validatePurchase = v1.https.onCall(async (data, context) => {
+exports.validatePurchase = v1
+  .runWith({
+    secrets: [APPSTORE_SHARED_SECRET],
+  })
+  .https.onCall(async (data, context) => {
   const { platform, receipt, packageName, productId, basePlanId, purchaseType } =
     data;
 
@@ -2738,7 +2772,11 @@ exports.validatePurchase = v1.https.onCall(async (data, context) => {
   }
 });
 
-exports.checkSubscription = v1.https.onCall(async (_, context) => {
+exports.checkSubscription = v1
+  .runWith({
+    secrets: [APPSTORE_SHARED_SECRET],
+  })
+  .https.onCall(async (_, context) => {
   logger.log("data", _);
 
   // Ensure the user is authenticated
@@ -3057,7 +3095,11 @@ exports.checkSubscription = v1.https.onCall(async (_, context) => {
  * @returns {Promise<Object>} Validation result.
  */
 async function validateAppleReceipt(receipt) {
-  const sharedSecret = v1.config().appstore.shared_secret;
+  const sharedSecret = APPSTORE_SHARED_SECRET.value();
+
+  if (!sharedSecret) {
+    throw new Error("APPSTORE_SHARED_SECRET is not configured.");
+  }
 
   const body = {
     "receipt-data": receipt,
@@ -3224,9 +3266,9 @@ async function validateGoogleProductReceipt(purchaseToken, packageName, productI
     const isConsumed =
       String(responseData?.consumptionState || "") === "1";
 
-      if (response.data?.acknowledgementState === 0) {
-        const acknowledge = await google
-          .androidpublisher("v3")
+    if (response.data?.acknowledgementState === 0) {
+      const acknowledge = await google
+        .androidpublisher("v3")
         .purchases.products.acknowledge({
           packageName,
           productId,
@@ -3242,12 +3284,12 @@ async function validateGoogleProductReceipt(purchaseToken, packageName, productI
       );
     }
 
-      if (!isConsumed) {
-        try {
-          const consume = await google
-            .androidpublisher("v3")
-            .purchases.products.consume({
-              packageName,
+    if (!isConsumed) {
+      try {
+        const consume = await google
+          .androidpublisher("v3")
+          .purchases.products.consume({
+            packageName,
             productId,
             token: purchaseToken,
             auth,
@@ -3263,11 +3305,11 @@ async function validateGoogleProductReceipt(purchaseToken, packageName, productI
       }
     }
 
-      logger.log("validateGoogleProductReceipt response", response);
-      return {
-        ...responseData,
-        consumptionState: responseData?.consumptionState,
-        voided: isVoidedPurchase,
+    logger.log("validateGoogleProductReceipt response", response);
+    return {
+      ...responseData,
+      consumptionState: responseData?.consumptionState,
+      voided: isVoidedPurchase,
       voidedReason: isVoidedPurchase
         ? voidedLookup.voidedPurchase?.voidedReason || null
         : null,
