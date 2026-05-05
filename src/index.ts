@@ -2472,6 +2472,31 @@ function isGoogleSubscriptionPurchase(
   );
 }
 
+function isGoogleSubscriptionEntitled(purchase: any): boolean {
+  const subscriptionState = String(purchase?.subscriptionState || "");
+
+  if (
+    subscriptionState === "SUBSCRIPTION_STATE_PENDING" ||
+    subscriptionState === "SUBSCRIPTION_STATE_PENDING_PURCHASE_CANCELED"
+  ) {
+    return false;
+  }
+
+  if (subscriptionState) {
+    return [
+      "SUBSCRIPTION_STATE_ACTIVE",
+      "SUBSCRIPTION_STATE_CANCELED",
+      "SUBSCRIPTION_STATE_IN_GRACE_PERIOD",
+    ].includes(subscriptionState);
+  }
+
+  return purchase?.paymentState !== 0;
+}
+
+function isGoogleAcknowledgementPending(value: unknown): boolean {
+  return value === 0 || value === "ACKNOWLEDGEMENT_STATE_PENDING";
+}
+
 function createGooglePublisherAuth() {
   return new google.auth.GoogleAuth({
     keyFile: "encurage-new-18b38f50569d.json",
@@ -2712,12 +2737,28 @@ exports.validatePurchase = v1
       });
       const resolvedBasePlanId =
         basePlanId || validationResponse?.basePlanId || productIdToUse;
+      const existingSubscriptionExpiryMs =
+        typeof existingPurchaseInfo?.subscriptionExpiry === "string"
+          ? Date.parse(existingPurchaseInfo.subscriptionExpiry)
+          : NaN;
+      const existingEntitlementActive =
+        existingPurchaseInfo?.entitlementType === "lifetime"
+          ? isLikelyLifetimeProductId(existingPurchaseInfo?.productId)
+          : !Number.isNaN(existingSubscriptionExpiryMs) &&
+            existingSubscriptionExpiryMs > now;
+      const shouldPreserveExistingPurchaseInfo =
+        requestedPurchaseType === "subs" &&
+        !isVoidedPurchase &&
+        isGoogleSubscriptionPurchase(validationResponse) &&
+        !isGoogleSubscriptionEntitled(validationResponse) &&
+        existingEntitlementActive;
       const entitlementActive =
         isVoidedPurchase
           ? false
           : normalizedEntitlement.entitlementType === "lifetime"
             ? validationResponse?.purchaseState === 0
-            : subscriptionExpiry
+            : subscriptionExpiry &&
+              isGoogleSubscriptionEntitled(validationResponse)
               ? subscriptionExpiry.getTime() > now
               : false;
 
@@ -2728,16 +2769,20 @@ exports.validatePurchase = v1
             subscribed: false,
           }
           : {
-            purchaseInfo: {
-              subscriptionExpiry: subscriptionExpiry?.toISOString() || null,
-              productId: productIdToUse,
-              basePlanId: resolvedBasePlanId || null,
-              purchaseToken: purchaseToken, // For Google
-              purchaseType: normalizedEntitlement.purchaseType,
-              entitlementType: normalizedEntitlement.entitlementType,
-              platform: "android",
-            },
-            subscribed: entitlementActive,
+            purchaseInfo: shouldPreserveExistingPurchaseInfo
+              ? existingPurchaseInfo
+              : {
+                subscriptionExpiry: subscriptionExpiry?.toISOString() || null,
+                productId: productIdToUse,
+                basePlanId: resolvedBasePlanId || null,
+                purchaseToken: purchaseToken, // For Google
+                purchaseType: normalizedEntitlement.purchaseType,
+                entitlementType: normalizedEntitlement.entitlementType,
+                platform: "android",
+              },
+            subscribed: shouldPreserveExistingPurchaseInfo
+              ? true
+              : entitlementActive,
           }
       );
 
@@ -2745,6 +2790,7 @@ exports.validatePurchase = v1
         // Kept for backward compatibility with existing app check.
         purchaseState: entitlementActive ? 1 : 0,
         paymentState: validationResponse.paymentState,
+        subscriptionState: validationResponse.subscriptionState || null,
         voided: validationResponse.voided,
         rawPurchaseState: validationResponse.purchaseState,
         orderId: validationResponse.orderId, // Additional info if needed
@@ -3003,11 +3049,13 @@ exports.checkSubscription = v1
         );
         const isAnnual = priceAmountMicros > 5000000; // Adjust based on your pricing
 
-        if (validationResponse.paymentState === 0) {
+        if (!isGoogleSubscriptionEntitled(validationResponse)) {
+          isSubscribed = false;
+        } else if (validationResponse.paymentState === 0) {
           // Billing issue: Apply grace period
           isSubscribed = applyGracePeriod(expiryMillis, isAnnual);
         } else {
-          // Treat any non-pending valid Google subscription as active until expiry.
+          // Treat any entitled Google subscription as active until expiry.
           isSubscribed = expiryMillis > now;
         }
 
@@ -3178,10 +3226,14 @@ async function validateGoogleSubscriptionReceipt(
           ? String(Date.parse(lineItem.expiryTime))
           : null;
     const v2PaymentState = () => {
-      const value =
-        lineItem?.autoRenewingPlan?.paymentState ??
-        lineItem?.acknowledgementState ??
-        null;
+      if (
+        v2Data.subscriptionState === "SUBSCRIPTION_STATE_PENDING" ||
+        v2Data.subscriptionState === "SUBSCRIPTION_STATE_PENDING_PURCHASE_CANCELED"
+      ) {
+        return 0;
+      }
+
+      const value = lineItem?.autoRenewingPlan?.paymentState ?? null;
       if (value === "PENDING" || value === 0) return 0;
       return value === "PAID" || value === 1 ? 1 : data.paymentState ?? 1;
     };
@@ -3213,7 +3265,10 @@ async function validateGoogleSubscriptionReceipt(
     }
 
     // Step 2: Check acknowledgment status
-    if (data?.acknowledgementState === 0 || lineItem?.acknowledgementState === 0) {
+    if (
+      isGoogleSubscriptionEntitled(enrichedData) &&
+      isGoogleAcknowledgementPending(data?.acknowledgementState)
+    ) {
       // Acknowledge the purchase if not already acknowledged
       const acknowledge = await google
         .androidpublisher("v3")
@@ -3265,8 +3320,9 @@ async function validateGoogleProductReceipt(purchaseToken, packageName, productI
       voidedLookup.voided || responseData?.voided === true;
     const isConsumed =
       String(responseData?.consumptionState || "") === "1";
+    const isPurchased = responseData?.purchaseState === 0;
 
-    if (response.data?.acknowledgementState === 0) {
+    if (isPurchased && response.data?.acknowledgementState === 0) {
       const acknowledge = await google
         .androidpublisher("v3")
         .purchases.products.acknowledge({
@@ -3284,7 +3340,7 @@ async function validateGoogleProductReceipt(purchaseToken, packageName, productI
       );
     }
 
-    if (!isConsumed) {
+    if (isPurchased && !isConsumed) {
       try {
         const consume = await google
           .androidpublisher("v3")
