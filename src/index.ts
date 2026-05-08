@@ -4837,17 +4837,35 @@ function createPrescriptionEvent(
   oldPres: OldPrescription, // the original old data if needed
   timeZone: string
 ): Prescription_events {
-  const nextDose = calculateNextDose(newPres, timeZone);
-  logger.log("nextDose", nextDose);
   const event: Prescription_events = {
     childId: newPres.childId,
     createDate: Date.now(), // You can also parse from oldPres if you want
     eventId: "",
-    nextScheduledDose: nextDose,
     prescriptionId: newPres.id,
     startDate: newPres.startDate,
     state: "active",
   };
+
+  try {
+    const nextDose = calculateNextDose(newPres, timeZone);
+    logger.log("nextDose", nextDose);
+    event.nextScheduledDose = nextDose;
+  } catch (error: any) {
+    if (
+      typeof error?.message === "string" &&
+      error.message.includes("next occurrence would be after end date")
+    ) {
+      logger.warn("Skipping active event for ended legacy prescription", {
+        prescriptionId: newPres.id,
+        childId: newPres.childId,
+        endDate: newPres.endDate,
+      });
+      event.state = "completed";
+      return event;
+    }
+
+    throw error;
+  }
 
   return event;
 }
