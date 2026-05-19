@@ -1,3 +1,4 @@
+import * as admin from "firebase-admin";
 import * as v1 from "firebase-functions/v1";
 
 export type VitalInsightsVitalKey =
@@ -56,51 +57,122 @@ export type VitalInsightsResponse = {
   stats: VitalInsightsStat[];
 };
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-const MAX_RANGE_MS = DAY_MS * 84;
-const ALLOWED_VITAL_KEYS: VitalInsightsVitalKey[] = [
-  "heartRate",
-  "bloodPressure",
-  "respiratoryRate",
-  "oxygenSaturation",
-  "bloodGlucoseLevel",
-  "peakExpiratoryFlowRate",
-];
-
-const HEART_RATE_WEEKLY_BASELINES = [
-  92, 94, 91, 96, 89, 93, 95, 90, 97, 94, 88, 92,
-];
-
-const BLOOD_PRESSURE_SYS_WEEKLY_BASELINES = [
-  88, 91, 86, 90, 84, 89, 92, 87, 93, 90, 85, 89,
-];
-
-const BLOOD_PRESSURE_DIA_WEEKLY_BASELINES = [
-  116, 121, 111, 118, 109, 114, 123, 112, 127, 119, 108, 115,
-];
-
-const hashString = (value: string): number => {
-  let hash = 0;
-
-  for (let i = 0; i < value.length; i += 1) {
-    hash = (hash * 31 + value.charCodeAt(i)) % 2147483647;
-  }
-
-  return hash || 1;
-};
-
-const createRandom = (seed: number) => {
-  let state = seed || 1;
-
-  return () => {
-    state = (state * 48271) % 2147483647;
-    return state / 2147483647;
+type TrackingRecord = {
+  id?: string;
+  childId?: string;
+  trackingType?: string;
+  category?: string;
+  data?: {
+    value?: string | number;
+    sysValue?: string | number;
+    diaValue?: string | number;
+    dateTime?: string | number;
   };
 };
 
-const clamp = (value: number, min: number, max: number): number =>
-  Math.max(min, Math.min(max, value));
+type VitalConfig = {
+  title: string;
+  unit: string;
+  categoryKeys: string[];
+  series: Omit<VitalInsightsSeries, "points">[];
+};
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+const MAX_RANGE_MS = DAY_MS * 84;
+
+// One config object drives both the database lookup and the response shape.
+// categoryKeys includes current camelCase values and older display-name values
+// because the RN app has saved both formats over time.
+const VITAL_CONFIG: Record<VitalInsightsVitalKey, VitalConfig> = {
+  heartRate: {
+    title: "Heart Rate (Pulse)",
+    unit: "bpm",
+    categoryKeys: ["heartRate", "Heart Rate (Pulse)"],
+    series: [
+      {
+        key: "heartRate",
+        label: "Heart Rate",
+        color: "#2E9593",
+        unit: "bpm",
+      },
+    ],
+  },
+  bloodPressure: {
+    title: "Blood Pressure",
+    unit: "mmHg",
+    categoryKeys: ["bloodPressure", "Blood Pressure"],
+    series: [
+      {
+        key: "sys",
+        label: "SYS",
+        color: "#D33030",
+        unit: "mmHg",
+      },
+      {
+        key: "dia",
+        label: "DIA",
+        color: "#3448F0",
+        unit: "mmHg",
+      },
+    ],
+  },
+  respiratoryRate: {
+    title: "Respiratory Rate",
+    unit: "breaths/min",
+    categoryKeys: ["respiratoryRate", "Respiratory Rate"],
+    series: [
+      {
+        key: "respiratoryRate",
+        label: "Respiratory Rate",
+        color: "#CA8A09",
+        unit: "breaths/min",
+      },
+    ],
+  },
+  oxygenSaturation: {
+    title: "Oxygen Saturation",
+    unit: "%",
+    categoryKeys: ["oxygenSaturation", "Oxygen Saturation"],
+    series: [
+      {
+        key: "oxygenSaturation",
+        label: "Oxygen Saturation",
+        color: "#3BA8A7",
+        unit: "%",
+      },
+    ],
+  },
+  bloodGlucoseLevel: {
+    title: "Blood Glucose Level",
+    unit: "mg/dL",
+    categoryKeys: ["bloodGlucoseLevel", "Blood Glucose Level"],
+    series: [
+      {
+        key: "bloodGlucoseLevel",
+        label: "Blood Glucose",
+        color: "#D33030",
+        unit: "mg/dL",
+      },
+    ],
+  },
+  peakExpiratoryFlowRate: {
+    title: "Peak Expiratory Flow Rate",
+    unit: "L/min",
+    categoryKeys: ["peakExpiratoryFlowRate", "Peak Expiratory Flow Rate"],
+    series: [
+      {
+        key: "peakExpiratoryFlowRate",
+        label: "Peak Flow",
+        color: "#4E807F",
+        unit: "L/min",
+      },
+    ],
+  },
+};
+
+// Keep request validation in this file so the callable only handles auth and
+// error wrapping. The RN screen limits ranges to 12 weeks, and the function
+// enforces the same limit before querying data.
 const validateRequest = (data: any): VitalInsightsRequest => {
   const {childId, vitalKey, startAt, endAt, preset} = data ?? {};
 
@@ -108,7 +180,7 @@ const validateRequest = (data: any): VitalInsightsRequest => {
     throw new v1.https.HttpsError("invalid-argument", "childId is required.");
   }
 
-  if (!ALLOWED_VITAL_KEYS.includes(vitalKey)) {
+  if (!Object.prototype.hasOwnProperty.call(VITAL_CONFIG, vitalKey)) {
     throw new v1.https.HttpsError("invalid-argument", "Unsupported vital key.");
   }
 
@@ -148,7 +220,7 @@ const validateRequest = (data: any): VitalInsightsRequest => {
   }
 
   return {
-    childId,
+    childId: childId.trim(),
     vitalKey,
     startAt,
     endAt,
@@ -156,160 +228,117 @@ const validateRequest = (data: any): VitalInsightsRequest => {
   };
 };
 
-const buildTimestamps = (
-  startAt: number,
-  endAt: number,
-  random: () => number
-): number[] => {
-  const timestamps: number[] = [];
-  const durationMs = endAt - startAt;
-  const durationDays = Math.max(1, Math.ceil(durationMs / DAY_MS));
-  const isSingleDay = durationMs <= DAY_MS;
-
-  if (isSingleDay) {
-    const count = 7 + Math.floor(random() * 5);
-    const interval = durationMs / (count + 1);
-
-    for (let i = 1; i <= count; i += 1) {
-      const jitter = (random() - 0.5) * interval * 0.45;
-      const timestamp = clamp(
-        Math.round(startAt + interval * i + jitter),
-        startAt,
-        endAt
-      );
-      timestamps.push(timestamp);
-    }
-
-    return timestamps.sort((a, b) => a - b);
+// Vitals are entered through text inputs in the RN app, so Firebase usually
+// stores the measurements as strings. Only finite numeric values are chartable.
+const toNumber = (value: unknown): number | null => {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
   }
 
-  for (let dayIndex = 0; dayIndex < durationDays; dayIndex += 1) {
-    const dayStart = startAt + dayIndex * DAY_MS;
-    const dayEnd = Math.min(dayStart + DAY_MS - 1, endAt);
-
-    if (random() < 0.12) {
-      continue;
-    }
-
-    const entriesToday = 1 + (random() > 0.62 ? 1 : 0) + (random() > 0.9 ? 1 : 0);
-
-    for (let i = 0; i < entriesToday; i += 1) {
-      const hourWindows = [8, 12, 17, 21];
-      const baseHour = hourWindows[(dayIndex + i) % hourWindows.length];
-      const hourOffset = (random() - 0.5) * 2.5;
-      const minute = Math.floor(random() * 60);
-      const timestamp = new Date(dayStart);
-      timestamp.setHours(
-        clamp(Math.round(baseHour + hourOffset), 0, 23),
-        minute,
-        0,
-        0
-      );
-
-      const nextValue = clamp(timestamp.getTime(), dayStart, dayEnd);
-
-      if (nextValue >= startAt && nextValue <= endAt) {
-        timestamps.push(nextValue);
-      }
-    }
+  if (typeof value !== "string") {
+    return null;
   }
 
-  return timestamps.sort((a, b) => a - b);
+  const parsed = Number(value.trim());
+  return Number.isFinite(parsed) ? parsed : null;
 };
 
-const buildSeriesPoints = (
-  timestamps: number[],
-  random: () => number,
-  options: {
-    min: number;
-    max: number;
-    baseline: number;
-    wave: number;
-    jitter: number;
+const isInRequestedRange = (
+  timestamp: number | null,
+  request: VitalInsightsRequest
+): timestamp is number =>
+  timestamp !== null &&
+  timestamp >= request.startAt &&
+  timestamp <= request.endAt;
+
+const fetchVitalRecords = async (
+  db: admin.database.Database,
+  request: VitalInsightsRequest,
+  categoryKeys: string[]
+): Promise<TrackingRecord[]> => {
+  const recordsById = new Map<string, TrackingRecord>();
+
+  // RTDB can query one category value at a time. Query each known category key
+  // for this vital, then de-dupe by Firebase key before sorting by reading time.
+  await Promise.all(
+    categoryKeys.map(async (category) => {
+      const snapshot = await db
+        .ref(`/tracking/${request.childId}`)
+        .orderByChild("category")
+        .equalTo(category)
+        .once("value");
+
+      snapshot.forEach((childSnapshot) => {
+        const record = childSnapshot.val() as TrackingRecord | null;
+
+        if (record?.trackingType === "vitals") {
+          recordsById.set(childSnapshot.key ?? record.id ?? category, {
+            ...record,
+            id: record.id ?? childSnapshot.key ?? undefined,
+          });
+        }
+
+        return false;
+      });
+    })
+  );
+
+  return [...recordsById.values()].sort((a, b) => {
+    const aTime = toNumber(a.data?.dateTime) ?? 0;
+    const bTime = toNumber(b.data?.dateTime) ?? 0;
+    return aTime - bTime;
+  });
+};
+
+// Even when there are no readings, the frontend expects the same series objects
+// so it can render legends, stats, and the no-data state without null checks.
+const buildEmptySeries = (config: VitalConfig): VitalInsightsSeries[] =>
+  config.series.map((series) => ({
+    ...series,
+    points: [],
+  }));
+
+const getStatsForSingleSeries = (
+  unit: string,
+  points: VitalInsightsPoint[]
+): VitalInsightsStat[] => {
+  if (points.length === 0) {
+    // Preserve the stat keys the RN UI translates, but avoid fake numeric data.
+    return [
+      {key: "latest", value: "No data"},
+      {key: "highest", value: "No data"},
+      {key: "lowest", value: "No data"},
+      {key: "totalReadings", value: "0"},
+    ];
   }
-): VitalInsightsPoint[] =>
-  timestamps.map((timestamp, index) => {
-    const curve =
-      Math.sin(index / 3.2) * options.wave +
-      Math.cos(index / 6.4) * (options.wave / 2);
-    const noise = (random() - 0.5) * options.jitter;
-    const value = clamp(
-      Math.round(options.baseline + curve + noise),
-      options.min,
-      options.max
-    );
 
-    return {
-      timestamp,
-      value,
-    };
-  });
-
-const buildHeartRatePoints = (
-  timestamps: number[],
-  random: () => number,
-  rangeStartAt: number
-): VitalInsightsPoint[] =>
-  timestamps.map((timestamp) => {
-    const weekIndex = Math.min(
-      HEART_RATE_WEEKLY_BASELINES.length - 1,
-      Math.max(0, Math.floor((timestamp - rangeStartAt) / DAY_MS / 7))
-    );
-    const weeklyBaseline = HEART_RATE_WEEKLY_BASELINES[weekIndex];
-    const dayPhase = ((timestamp - rangeStartAt) / DAY_MS) % 7;
-    const dailyDrift = Math.sin(dayPhase / 1.15) * 2.4;
-    const noise = (random() - 0.5) * 5;
-
-    return {
-      timestamp,
-      value: clamp(Math.round(weeklyBaseline + dailyDrift + noise), 82, 108),
-    };
-  });
-
-const buildBloodPressurePoints = (
-  timestamps: number[],
-  random: () => number,
-  rangeStartAt: number,
-  weeklyBaselines: number[],
-  min: number,
-  max: number,
-  dailyDriftStrength: number,
-  jitter: number
-): VitalInsightsPoint[] =>
-  timestamps.map((timestamp) => {
-    const weekIndex = Math.min(
-      weeklyBaselines.length - 1,
-      Math.max(0, Math.floor((timestamp - rangeStartAt) / DAY_MS / 7))
-    );
-    const baseline = weeklyBaselines[weekIndex];
-    const dayPhase = ((timestamp - rangeStartAt) / DAY_MS) % 7;
-    const dailyDrift = Math.cos(dayPhase / 1.3) * dailyDriftStrength;
-    const noise = (random() - 0.5) * jitter;
-
-    return {
-      timestamp,
-      value: clamp(Math.round(baseline + dailyDrift + noise), min, max),
-    };
-  });
-
-const getStatsForSingleSeries = (unit: string, points: VitalInsightsPoint[]) => {
   const sortedByValue = [...points].sort((a, b) => a.value - b.value);
   const latest = points[points.length - 1];
   const lowest = sortedByValue[0];
   const highest = sortedByValue[sortedByValue.length - 1];
 
   return [
-    {key: "latest" as const, value: `${latest.value} ${unit}`},
-    {key: "highest" as const, value: `${highest.value} ${unit}`},
-    {key: "lowest" as const, value: `${lowest.value} ${unit}`},
-    {key: "totalReadings" as const, value: String(points.length)},
+    {key: "latest", value: `${latest.value} ${unit}`},
+    {key: "highest", value: `${highest.value} ${unit}`},
+    {key: "lowest", value: `${lowest.value} ${unit}`},
+    {key: "totalReadings", value: String(points.length)},
   ];
 };
 
 const getStatsForBloodPressure = (
   systolic: VitalInsightsPoint[],
   diastolic: VitalInsightsPoint[]
-) => {
+): VitalInsightsStat[] => {
+  if (systolic.length === 0 || diastolic.length === 0) {
+    // Blood pressure has different stat keys because the chart has two series.
+    return [
+      {key: "latestBp", value: "No data"},
+      {key: "highestSys", value: "No data"},
+      {key: "lowestDia", value: "No data"},
+      {key: "totalReadings", value: "0"},
+    ];
+  }
+
   const highestSys = [...systolic].sort((a, b) => b.value - a.value)[0];
   const lowestDia = [...diastolic].sort((a, b) => a.value - b.value)[0];
   const latestSys = systolic[systolic.length - 1];
@@ -317,168 +346,72 @@ const getStatsForBloodPressure = (
 
   return [
     {
-      key: "latestBp" as const,
+      key: "latestBp",
       value: `${latestSys.value}/${latestDia.value} mmHg`,
     },
-    {key: "highestSys" as const, value: `${highestSys.value} mmHg`},
-    {key: "lowestDia" as const, value: `${lowestDia.value} mmHg`},
-    {key: "totalReadings" as const, value: String(systolic.length)},
+    {key: "highestSys", value: `${highestSys.value} mmHg`},
+    {key: "lowestDia", value: `${lowestDia.value} mmHg`},
+    {key: "totalReadings", value: String(systolic.length)},
   ];
 };
 
-export const getVitalInsightsPayload = (
-  rawData: any
-): VitalInsightsResponse => {
+const buildSeriesFromRecords = (
+  request: VitalInsightsRequest,
+  records: TrackingRecord[],
+  config: VitalConfig
+): VitalInsightsSeries[] => {
+  const series = buildEmptySeries(config);
+
+  // Convert each tracking record into one or more chart points. Single-value
+  // vitals use data.value; blood pressure uses paired SYS/DIA values.
+  records.forEach((record) => {
+    const timestamp = toNumber(record.data?.dateTime);
+
+    if (!isInRequestedRange(timestamp, request)) {
+      return;
+    }
+
+    if (request.vitalKey === "bloodPressure") {
+      const systolic = toNumber(record.data?.sysValue);
+      const diastolic = toNumber(record.data?.diaValue);
+
+      if (systolic !== null && diastolic !== null) {
+        series[0].points.push({timestamp, value: systolic});
+        series[1].points.push({timestamp, value: diastolic});
+      }
+
+      return;
+    }
+
+    const value = toNumber(record.data?.value);
+
+    if (value !== null) {
+      series[0].points.push({timestamp, value});
+    }
+  });
+
+  return series;
+};
+
+export const getVitalInsightsPayload = async (
+  rawData: any,
+  db: admin.database.Database
+): Promise<VitalInsightsResponse> => {
+  // Main flow: validate request, load matching tracking rows, map them into the
+  // chart contract the RN VitalInsights screen already consumes, then summarize.
   const request = validateRequest(rawData);
-  const seed = hashString(
-    `${request.childId}:${request.vitalKey}:${request.startAt}:${request.endAt}:${request.preset}`
-  );
-  const random = createRandom(seed);
-  const timestamps = buildTimestamps(request.startAt, request.endAt, random);
-
-  let series: VitalInsightsSeries[] = [];
-  let unit = "";
-  let title = "";
-
-  switch (request.vitalKey) {
-    case "heartRate":
-      unit = "bpm";
-      title = "Heart Rate (Pulse)";
-      series = [
-        {
-          key: "heartRate",
-          label: "Heart Rate",
-          color: "#2E9593",
-          unit,
-          points: buildHeartRatePoints(timestamps, random, request.startAt),
-        },
-      ];
-      break;
-    case "bloodPressure":
-      unit = "mmHg";
-      title = "Blood Pressure";
-      series = [
-        {
-          key: "sys",
-          label: "SYS",
-          color: "#D33030",
-          unit,
-          points: buildBloodPressurePoints(
-            timestamps,
-            random,
-            request.startAt,
-            BLOOD_PRESSURE_SYS_WEEKLY_BASELINES,
-            78,
-            96,
-            3.5,
-            6
-          ),
-        },
-        {
-          key: "dia",
-          label: "DIA",
-          color: "#3448F0",
-          unit,
-          points: buildBloodPressurePoints(
-            timestamps,
-            random,
-            request.startAt,
-            BLOOD_PRESSURE_DIA_WEEKLY_BASELINES,
-            102,
-            134,
-            4.5,
-            8
-          ),
-        },
-      ];
-      break;
-    case "respiratoryRate":
-      unit = "breaths/min";
-      title = "Respiratory Rate";
-      series = [
-        {
-          key: "respiratoryRate",
-          label: "Respiratory Rate",
-          color: "#CA8A09",
-          unit,
-          points: buildSeriesPoints(timestamps, random, {
-            min: 14,
-            max: 32,
-            baseline: 22,
-            wave: 4,
-            jitter: 4,
-          }),
-        },
-      ];
-      break;
-    case "oxygenSaturation":
-      unit = "%";
-      title = "Oxygen Saturation";
-      series = [
-        {
-          key: "oxygenSaturation",
-          label: "Oxygen Saturation",
-          color: "#3BA8A7",
-          unit,
-          points: buildSeriesPoints(timestamps, random, {
-            min: 91,
-            max: 100,
-            baseline: 97,
-            wave: 1.8,
-            jitter: 1.5,
-          }),
-        },
-      ];
-      break;
-    case "bloodGlucoseLevel":
-      unit = "mg/dL";
-      title = "Blood Glucose Level";
-      series = [
-        {
-          key: "bloodGlucoseLevel",
-          label: "Blood Glucose",
-          color: "#D33030",
-          unit,
-          points: buildSeriesPoints(timestamps, random, {
-            min: 72,
-            max: 168,
-            baseline: 106,
-            wave: 16,
-            jitter: 14,
-          }),
-        },
-      ];
-      break;
-    case "peakExpiratoryFlowRate":
-      unit = "L/min";
-      title = "Peak Expiratory Flow Rate";
-      series = [
-        {
-          key: "peakExpiratoryFlowRate",
-          label: "Peak Flow",
-          color: "#4E807F",
-          unit,
-          points: buildSeriesPoints(timestamps, random, {
-            min: 140,
-            max: 420,
-            baseline: 275,
-            wave: 48,
-            jitter: 28,
-          }),
-        },
-      ];
-      break;
-  }
-
+  const config = VITAL_CONFIG[request.vitalKey];
+  const records = await fetchVitalRecords(db, request, config.categoryKeys);
+  const series = buildSeriesFromRecords(request, records, config);
   const stats =
     request.vitalKey === "bloodPressure"
       ? getStatsForBloodPressure(series[0].points, series[1].points)
-      : getStatsForSingleSeries(unit, series[0].points);
+      : getStatsForSingleSeries(config.unit, series[0].points);
 
   return {
     vitalKey: request.vitalKey,
-    title,
-    unit,
+    title: config.title,
+    unit: config.unit,
     range: {
       startAt: request.startAt,
       endAt: request.endAt,

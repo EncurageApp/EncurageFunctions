@@ -2291,7 +2291,7 @@ export const getVitalInsights = v1.https.onCall(async (data, context) => {
   }
 
   try {
-    return getVitalInsightsPayload(data);
+    return await getVitalInsightsPayload(data, db);
   } catch (error: any) {
     if (error instanceof v1.https.HttpsError) {
       throw error;
