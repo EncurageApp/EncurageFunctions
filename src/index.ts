@@ -1210,6 +1210,10 @@ async function sendPushNotificationsToUser(
     const androidConfig: admin.messaging.AndroidConfig = {
       priority: "high",
       collapseKey: threadId || "default",
+      notification: {
+        sound: "default",
+        channelId: "dose_reminders",
+      },
     };
 
     const iosConfig: admin.messaging.ApnsConfig = {

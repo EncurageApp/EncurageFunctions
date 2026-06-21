@@ -126,7 +126,7 @@ const DEFAULT_TEMPERATURE_UNIT: TemperatureUnit = "F";
 
 const SYMPTOM_INSIGHTS_COLORS = {
   temperature: "#D33030",
-  severity: "#CA8A09",
+  severity: "#3448F0",
   pain: "#3BA8A7",
 };
 
