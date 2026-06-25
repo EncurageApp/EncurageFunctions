@@ -20,6 +20,7 @@ export type SymptomInsightsRequest = {
   endAt: number;
   preset: SymptomInsightsPreset;
   displayUnit?: TemperatureUnit;
+  folderName?: string;
 };
 
 type SymptomInsightsPoint = {
@@ -109,6 +110,9 @@ export type SymptomInsightsResponse =
 type TrackingRecord = {
   id?: string;
   trackingType?: string;
+  folder?: {
+    name?: string;
+  };
   data?: {
     dateTime?: string | number;
     symptoms?: Record<string, any>;
@@ -225,6 +229,7 @@ const validateRequest = (data: any): SymptomInsightsRequest => {
     endAt,
     preset,
     displayUnit,
+    folderName,
   } = data ?? {};
 
   if (typeof childId !== "string" || !childId.trim()) {
@@ -299,6 +304,10 @@ const validateRequest = (data: any): SymptomInsightsRequest => {
     endAt,
     preset,
     displayUnit,
+    folderName:
+      typeof folderName === "string" && folderName.trim()
+        ? folderName.trim()
+        : undefined,
   };
 };
 
@@ -376,7 +385,10 @@ const fetchTrackingRecords = async (
   snapshot.forEach((childSnapshot) => {
     const record = childSnapshot.val() as TrackingRecord | null;
 
-    if (record?.trackingType === request.trackingType) {
+    if (
+      record?.trackingType === request.trackingType &&
+      (!request.folderName || record.folder?.name === request.folderName)
+    ) {
       records.push({
         ...record,
         id: record.id ?? childSnapshot.key ?? undefined,

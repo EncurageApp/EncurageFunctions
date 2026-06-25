@@ -17,6 +17,7 @@ export type VitalInsightsRequest = {
   startAt: number;
   endAt: number;
   preset: VitalInsightsPreset;
+  folderName?: string;
 };
 
 type VitalInsightsPoint = {
@@ -62,6 +63,9 @@ type TrackingRecord = {
   childId?: string;
   trackingType?: string;
   category?: string;
+  folder?: {
+    name?: string;
+  };
   data?: {
     value?: string | number;
     sysValue?: string | number;
@@ -174,7 +178,7 @@ const VITAL_CONFIG: Record<VitalInsightsVitalKey, VitalConfig> = {
 // error wrapping. The RN screen limits ranges to 12 weeks, and the function
 // enforces the same limit before querying data.
 const validateRequest = (data: any): VitalInsightsRequest => {
-  const {childId, vitalKey, startAt, endAt, preset} = data ?? {};
+  const {childId, vitalKey, startAt, endAt, preset, folderName} = data ?? {};
 
   if (typeof childId !== "string" || !childId.trim()) {
     throw new v1.https.HttpsError("invalid-argument", "childId is required.");
@@ -225,6 +229,10 @@ const validateRequest = (data: any): VitalInsightsRequest => {
     startAt,
     endAt,
     preset,
+    folderName:
+      typeof folderName === "string" && folderName.trim()
+        ? folderName.trim()
+        : undefined,
   };
 };
 
@@ -271,7 +279,10 @@ const fetchVitalRecords = async (
       snapshot.forEach((childSnapshot) => {
         const record = childSnapshot.val() as TrackingRecord | null;
 
-        if (record?.trackingType === "vitals") {
+        if (
+          record?.trackingType === "vitals" &&
+          (!request.folderName || record.folder?.name === request.folderName)
+        ) {
           recordsById.set(childSnapshot.key ?? record.id ?? category, {
             ...record,
             id: record.id ?? childSnapshot.key ?? undefined,
