@@ -12,6 +12,7 @@ import { google } from "googleapis";
 import { getVitalInsightsPayload } from "./vitalInsights";
 import { getSymptomInsightsPayload } from "./symptomInsights";
 import { getTherapyInsightsPayload } from "./therapyInsights";
+import { getGrowthInsightsPayload } from "./growthInsights";
 
 logger.log("[startup] container code loaded at", new Date().toISOString());
 // 🔥 Log any uncaught runtime issues before container dies
@@ -2362,6 +2363,32 @@ export const getTherapyInsights = v1.https.onCall(async (data, context) => {
     throw new v1.https.HttpsError(
       "internal",
       error?.message || "Failed to build therapy insights."
+    );
+  }
+});
+
+export const getGrowthInsights = v1.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new v1.https.HttpsError(
+      "unauthenticated",
+      "Function must be called while authenticated."
+    );
+  }
+
+  try {
+    return await getGrowthInsightsPayload(data, db);
+  } catch (error: any) {
+    if (error instanceof v1.https.HttpsError) {
+      throw error;
+    }
+
+    logger.error("getGrowthInsights failed", {
+      message: error?.message,
+      stack: error?.stack,
+    });
+    throw new v1.https.HttpsError(
+      "internal",
+      error?.message || "Failed to build growth insights."
     );
   }
 });
