@@ -1,9 +1,10 @@
 {
   "name": "functions",
-  "version": "0.1.11",
+  "version": "0.1.13",
   "scripts": {
     "lint": "eslint --ext .js,.ts .",
     "build": "tsc",
+    "test": "npm run build && node --test test/*.test.js",
     "build:watch": "tsc --watch",
     "serve": "npm run build && firebase emulators:start --only functions",
     "shell": "npm run build && firebase functions:shell",

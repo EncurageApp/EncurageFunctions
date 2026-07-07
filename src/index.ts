@@ -13,6 +13,29 @@ import { getVitalInsightsPayload } from "./vitalInsights";
 import { getSymptomInsightsPayload } from "./symptomInsights";
 import { getTherapyInsightsPayload } from "./therapyInsights";
 import { getGrowthInsightsPayload } from "./growthInsights";
+import { getJournalInsightsPayload } from "./journalInsights";
+import { getNotificationV2Route } from "./notificationsV2/routing";
+
+export {
+  checkEventDosesV2Cron,
+  checkNextNotificationTimeV2Cron,
+  processPrescriptionEventsV2Cron,
+  processPrescriptionNextNotificationV2Cron,
+  reconcileEventNotificationsV2Cron,
+  reconcilePrescriptionNotificationsV2Cron,
+  retryNotificationV2Cron,
+  settleNotificationV2Terminal,
+} from "./notificationsV2/functions";
+
+export {
+  populateEventParentIdV2,
+  populatePrescriptionEventParentIdV2,
+} from "./notificationsV2/parentIdTriggers";
+
+export {
+  reconcileAsNeededDoseGivenV2,
+  reconcilePrescriptionDoseGivenV2,
+} from "./notificationsV2/givenReconciliation";
 
 logger.log("[startup] container code loaded at", new Date().toISOString());
 // 🔥 Log any uncaught runtime issues before container dies
@@ -318,6 +341,17 @@ export const checkEventDoses = async () => {
           if (!child) {
             throw new Error(`Child not found for ID ${event.childId}`);
           }
+          const notificationV2Route = getNotificationV2Route(
+            child.parentId || child.parent_id
+          );
+          if (notificationV2Route.useV2) {
+            logger.info("V1 skipping V2-owned event", {
+              eventId,
+              notificationRoute: notificationV2Route.reason,
+              notificationBucket: notificationV2Route.bucket,
+            });
+            return;
+          }
         } catch (error) {
           logger.error(`Error fetching child for event ${eventId}:`, error);
         }
@@ -464,6 +498,17 @@ export const checkNextNotificationTime = async () => {
           child = await getChild(event.childId);
           if (!child) {
             throw new Error(`Child not found for ID ${event.childId}`);
+          }
+          const notificationV2Route = getNotificationV2Route(
+            child.parentId || child.parent_id
+          );
+          if (notificationV2Route.useV2) {
+            logger.info("V1 skipping V2-owned event", {
+              eventId,
+              notificationRoute: notificationV2Route.reason,
+              notificationBucket: notificationV2Route.bucket,
+            });
+            return;
           }
         } catch (error) {
           logger.error(`Error fetching child for event ${eventId}:`, error);
@@ -615,6 +660,17 @@ export const processPrescriptionEvents = async () => {
           child = await getChild(event.childId);
           if (!child) {
             throw new Error(`Child not found for ID ${event.childId}`);
+          }
+          const notificationV2Route = getNotificationV2Route(
+            child.parentId || child.parent_id
+          );
+          if (notificationV2Route.useV2) {
+            logger.info("V1 skipping V2-owned event", {
+              eventId,
+              notificationRoute: notificationV2Route.reason,
+              notificationBucket: notificationV2Route.bucket,
+            });
+            return;
           }
           notificationBodyParts.childName = child.childName;
         } catch (error) {
@@ -785,6 +841,17 @@ export const processPrescriptionNextNotificationTime = async () => {
           const child = await getChild(event.childId);
           if (!child)
             throw new Error(`Child not found for ID ${event.childId}`);
+          const notificationV2Route = getNotificationV2Route(
+            child.parentId || child.parent_id
+          );
+          if (notificationV2Route.useV2) {
+            logger.info("V1 skipping V2-owned event", {
+              eventId,
+              notificationRoute: notificationV2Route.reason,
+              notificationBucket: notificationV2Route.bucket,
+            });
+            return;
+          }
 
           const parent = await getUser(child.parentId);
           if (!parent)
@@ -2389,6 +2456,32 @@ export const getGrowthInsights = v1.https.onCall(async (data, context) => {
     throw new v1.https.HttpsError(
       "internal",
       error?.message || "Failed to build growth insights."
+    );
+  }
+});
+
+export const getJournalInsights = v1.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new v1.https.HttpsError(
+      "unauthenticated",
+      "Function must be called while authenticated."
+    );
+  }
+
+  try {
+    return await getJournalInsightsPayload(data, db);
+  } catch (error: any) {
+    if (error instanceof v1.https.HttpsError) {
+      throw error;
+    }
+
+    logger.error("getJournalInsights failed", {
+      message: error?.message,
+      stack: error?.stack,
+    });
+    throw new v1.https.HttpsError(
+      "internal",
+      error?.message || "Failed to build journal insights."
     );
   }
 });
