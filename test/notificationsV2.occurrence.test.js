@@ -102,6 +102,25 @@ test("given corrects skipped without advancing the next occurrence twice", () =>
   assert.equal(result._notificationV2LastResolution.status, "given");
 });
 
+test("given completes a prescription when there is no next occurrence", () => {
+  const result = applyGivenPrescriptionOccurrence(
+    {
+      state: "active",
+      nextScheduledDose: 1000,
+      nextNotificationTime: 1100,
+      notificationCount: 4,
+    },
+    1000,
+    "given-dose",
+    null,
+    1500
+  );
+
+  assert.equal(result.state, "completed");
+  assert.equal(result.nextScheduledDose, null);
+  assert.equal(result._notificationV2LastResolution.status, "given");
+});
+
 test("as-needed given wins a simultaneous terminal pause", () => {
   const result = applyGivenAsNeededOccurrence(
     {

@@ -109,7 +109,7 @@ boundary overlap between independent invocations.
 
 Recovery preserves the schedule resolver's existing behavior: it sends only the
 latest applicable non-terminal checkpoint while the occurrence remains open,
-sends a terminal skipped notification only inside the five-minute terminal
+sends a terminal skipped notification only inside the ten-minute terminal
 grace, and advances older terminal state without an obsolete push.
 
 ## Phase 4 given-versus-terminal resolution
@@ -138,6 +138,53 @@ changed. It finalizes skipped state before delivery and rechecks given state
 before sending. Existing checkpoint and recipient attempt keys make task
 retries idempotent.
 
+Terminal reliability behavior:
+
+1. The primary terminal queue records `enqueuedAt`, `scheduledFor`, `startedAt`,
+   `latenessMs`, and `dueLatenessMs` in structured logs. Processing more than
+   one minute after `scheduledFor` emits `V2 terminal settlement late` at
+   warning severity.
+2. The skipped-push grace is ten minutes from the terminal due time. The
+   30-second given-wins settlement delay remains unchanged.
+3. When the final occurrence reaches the prescription end date, terminal
+   processing materializes the skipped dose, clears notification and snooze
+   state, changes the prescription event to `completed`, sends the skipped
+   notification inside the grace period, and returns success. It does not retry
+   the expected absence of another dose.
+4. Unexpected primary-task failures are written to
+   `notification_v2_terminal_jobs` and acknowledged on the primary queue.
+   `retryNotificationV2TerminalCron` owns those retries independently, with a
+   lease, exponential backoff, five attempts, and a final `dead_letter` state.
+   This prevents an unexpected terminal failure from repeatedly returning 500
+   and throttling normal skipped notifications.
+
+### Terminal latency monitoring
+
+The deployed code emits a structured warning whenever terminal processing
+starts more than one minute late. Create a Cloud Monitoring log-based alert
+using this filter:
+
+```text
+resource.type="cloud_run_revision"
+jsonPayload.message="V2 terminal settlement late"
+jsonPayload.latenessMs>60000
+```
+
+A notification channel is where Google sends the alert; it is not part of push
+notification processing. Supported destinations include email, SMS, Slack,
+PagerDuty, and the Google Cloud mobile app. Without a channel, the warning is
+still recorded in Cloud Logging, but nobody is proactively notified.
+
+Start with an email notification channel and alert on any matching warning
+during the canary. At broader rollout, retain the immediate alert and add a
+sustained-rate policy so both one late terminal task and a queue-level incident
+remain visible. Also create alerts for `V2 isolated terminal retry failed` and
+jobs reaching `dead_letter`.
+
+Monitoring status as of July 11, 2026: structured lateness logging is deployed.
+The Cloud Monitoring alert policy and notification channel are not yet created;
+this does not affect terminal processing or mobile push delivery.
+
 Phase 4 deployment order is mandatory:
 
 1. Deploy `settleNotificationV2Terminal` so Firebase creates its Cloud Tasks
@@ -150,6 +197,21 @@ Phase 4 deployment order is mandatory:
    retry logs with the UID canary before any cohort expansion.
 
 Do not deploy the enqueueing worker revisions before steps 1 and 2.
+
+Terminal reliability production status as of July 11, 2026:
+
+1. The `notification_v2_terminal_jobs/.indexOn` rule was added.
+2. `retryNotificationV2TerminalCron`, `settleNotificationV2Terminal`,
+   `reconcilePrescriptionDoseGivenV2`, and the six V2 live/recovery workers were
+   deployed successfully.
+3. The primary terminal queue is running with two maximum attempts, five-second
+   backoff, and a 30-second maximum retry duration. Processing failures that are
+   successfully recorded in the isolated retry ledger return HTTP 2xx and do
+   not consume the second primary attempt.
+4. `retryNotificationV2TerminalCron` completed its first production invocation
+   with HTTP 200.
+5. The remaining operational step is creating the Cloud Monitoring alert and
+   selecting its notification channel.
 
 ## Phase 5 rollout controls
 
@@ -227,6 +289,48 @@ Operational cleanup:
 4. Database rules: when doing the broader rules cleanup, add the V2 server-only
    nodes below and add `"occurrenceKey"` to `prescription_doses/.indexOn`.
 
+Known design follow-ups:
+
+1. Overlapping prescription dose windows need occurrence-level notification
+   state. A real canary example was `Test med` for child `Test`, with daily
+   reminder times at 4:50 PM and 5:30 PM. Each dose uses the one-hour reminder
+   sequence of initial, +10 minutes, +20 minutes, +45 minutes, and +60 minutes
+   skipped. Because the 5:30 PM occurrence starts before the 4:50 PM
+   occurrence reaches terminal, the current `prescription_events` state can
+   only represent one open chain at a time.
+
+   Current V2 stores only one `nextScheduledDose`, one `nextNotificationTime`,
+   and one `notificationCount` on the event. While that reminder state exists,
+   the initial prescription worker intentionally skips the event. In the canary
+   case, FCM accepted the 4:50, 5:00, 5:10, and 5:35 pushes for the 4:50
+   occurrence. The 5:30 occurrence could not start independently, so catch-up
+   later processed it from the latest applicable stage instead of sending the
+   missing 5:30 and 5:40 notifications. The final skipped notification was also
+   processed outside the terminal send grace, so the dose was marked skipped
+   without sending an obsolete skipped push.
+
+   This is not a stale-token or FCM delivery problem. It is a state-model
+   limitation caused by serializing multiple scheduled occurrences through one
+   event-level reminder chain. V1 did not truly support overlapping reminder
+   chains either; it calculated the next prescription dose from the current
+   time, so an already-past same-day reminder could be skipped over instead of
+   represented as an independent open occurrence.
+
+   Recommended fix: move prescription reminder state from event-level fields to
+   occurrence-level records, for example
+   `notification_v2_occurrences/prescription/{eventId}_{occurrenceAt}`. Each
+   occurrence should own its own `occurrenceAt`, `nextNotificationTime`,
+   `notificationCount`, status, lease/runtime metadata, delivery attempts, and
+   terminal settlement task. The event can still keep `nextScheduledDose` as the
+   next future occurrence pointer for app compatibility, but delivery workers
+   should process due occurrence records so overlapping 4:50 and 5:30 chains can
+   run independently and idempotently.
+
+2. The former `No next dose: next occurrence would be after end date` terminal
+   retry storm is handled by treating the final occurrence as a successful
+   completion. This fixes queue throttling from that error but does not address
+   the separate overlapping-occurrence state model described above.
+
 ## V2 database rules fragment
 
 The following nodes are server-only. These denies work only after removing the
@@ -249,6 +353,11 @@ root authenticated read/write grants because RTDB parent grants cascade.
   ".read": false,
   ".write": false,
   ".indexOn": ["dueAt", "status", "userId", "eventId"]
+},
+"notification_v2_terminal_jobs": {
+  ".read": false,
+  ".write": false,
+  ".indexOn": ["nextAttemptAt", "status", "eventId"]
 }
 ```
 

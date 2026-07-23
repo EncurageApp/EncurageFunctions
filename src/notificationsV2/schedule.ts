@@ -1,7 +1,9 @@
 import moment from "moment-timezone";
 
 export const MINUTE_MS = 60_000;
-export const TERMINAL_SEND_GRACE_MS = 5 * MINUTE_MS;
+export const TERMINAL_SEND_GRACE_MS = 10 * MINUTE_MS;
+export const NO_NEXT_DOSE_AFTER_END_DATE =
+  "No next dose: next occurrence would be after end date.";
 
 export type NotificationStage = 0 | 1 | 2 | 3 | 4;
 
@@ -12,6 +14,24 @@ export type DueStage = {
   nextNotificationCount: number | null;
   supersededStages: NotificationStage[];
 };
+
+export function terminalStageAfterReminder(
+  dueStage: DueStage
+): DueStage | null {
+  if (
+    dueStage.nextNotificationCount !== 4 ||
+    typeof dueStage.nextNotificationTime !== "number"
+  ) {
+    return null;
+  }
+  return {
+    stage: 4,
+    dueAt: dueStage.nextNotificationTime,
+    nextNotificationTime: null,
+    nextNotificationCount: null,
+    supersededStages: [],
+  };
+}
 
 const defaultIntervalsAfterStage: Record<0 | 1 | 2 | 3, number> = {
   0: 10,
@@ -94,10 +114,14 @@ export function resolveDueStage(event: any, now: number): DueStage | null {
 
 const ensureBeforeEnd = (candidate: number, endDate?: number): number => {
   if (typeof endDate === "number" && candidate > endDate) {
-    throw new Error("No next dose: next occurrence would be after end date.");
+    throw new Error(NO_NEXT_DOSE_AFTER_END_DATE);
   }
   return candidate;
 };
+
+export function isNoNextDoseAfterEndDateError(error: unknown): boolean {
+  return error instanceof Error && error.message === NO_NEXT_DOSE_AFTER_END_DATE;
+}
 
 export function calculateNextDoseAfter(
   prescription: any,
@@ -264,4 +288,21 @@ export function calculateNextDoseAfter(
   }
 
   throw new Error(`Unable to calculate next dose for ${frequency.type}.`);
+}
+
+export function calculateNextDoseAfterOrNull(
+  prescription: any,
+  previousScheduledDose: number,
+  backupTimeZone?: string
+): number | null {
+  try {
+    return calculateNextDoseAfter(
+      prescription,
+      previousScheduledDose,
+      backupTimeZone
+    );
+  } catch (error) {
+    if (isNoNextDoseAfterEndDateError(error)) return null;
+    throw error;
+  }
 }

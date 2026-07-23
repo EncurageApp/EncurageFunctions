@@ -14,6 +14,7 @@ import { getSymptomInsightsPayload } from "./symptomInsights";
 import { getTherapyInsightsPayload } from "./therapyInsights";
 import { getGrowthInsightsPayload } from "./growthInsights";
 import { getJournalInsightsPayload } from "./journalInsights";
+import { getMedicationInsightsPayload } from "./medicationInsights";
 import { getNotificationV2Route } from "./notificationsV2/routing";
 
 export {
@@ -24,6 +25,7 @@ export {
   reconcileEventNotificationsV2Cron,
   reconcilePrescriptionNotificationsV2Cron,
   retryNotificationV2Cron,
+  retryNotificationV2TerminalCron,
   settleNotificationV2Terminal,
 } from "./notificationsV2/functions";
 
@@ -2378,6 +2380,29 @@ export const getVitalInsights = v1.https.onCall(async (data, context) => {
     throw new v1.https.HttpsError(
       "internal",
       error?.message || "Failed to build vital insights."
+    );
+  }
+});
+
+export const getMedicationInsights = v1.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new v1.https.HttpsError(
+      "unauthenticated",
+      "Function must be called while authenticated."
+    );
+  }
+
+  try {
+    return await getMedicationInsightsPayload(data, db);
+  } catch (error: any) {
+    if (error instanceof v1.https.HttpsError) throw error;
+    logger.error("getMedicationInsights failed", {
+      message: error?.message,
+      stack: error?.stack,
+    });
+    throw new v1.https.HttpsError(
+      "internal",
+      error?.message || "Failed to build medication insights."
     );
   }
 });
@@ -5039,6 +5064,7 @@ function createPrescriptionEvent(
         endDate: newPres.endDate,
       });
       event.state = "completed";
+      event.completedAt = Date.now();
       return event;
     }
 
@@ -5210,6 +5236,7 @@ type Prescription_events = {
   snoozeInterval?: number; // TODO add to event when snoozed notification?
   state?: string;
   eventId?: string;
+  completedAt?: number;
 };
 
 /**

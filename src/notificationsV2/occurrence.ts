@@ -50,7 +50,7 @@ export function applyGivenPrescriptionOccurrence(
   current: any,
   occurrenceAt: number,
   givenDoseId: string,
-  nextScheduledDose: number,
+  nextScheduledDose: number | null,
   resolvedAt: number
 ): any | undefined {
   if (current === null) return null;
@@ -63,7 +63,11 @@ export function applyGivenPrescriptionOccurrence(
 
   return {
     ...current,
-    ...(isCurrentOccurrence ? {nextScheduledDose} : {}),
+    ...(isCurrentOccurrence && nextScheduledDose === null
+      ? {state: "completed", completedAt: resolvedAt, nextScheduledDose: null}
+      : isCurrentOccurrence
+        ? {nextScheduledDose}
+        : {}),
     nextNotificationTime: null,
     notificationCount: null,
     snoozeInterval: null,

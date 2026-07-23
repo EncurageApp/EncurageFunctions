@@ -12,7 +12,7 @@ import {
   findNewlyGivenAsNeededOccurrence,
   prescriptionDoseKey,
 } from "./occurrence";
-import {calculateNextDoseAfter} from "./schedule";
+import {calculateNextDoseAfterOrNull} from "./schedule";
 
 const getDb = () => admin.app().database();
 
@@ -97,7 +97,7 @@ export async function reconcileGivenPrescriptionOccurrence(
     .once("value");
   if (!prescriptionSnapshot.exists()) return false;
   const prescription = prescriptionSnapshot.val();
-  const nextScheduledDose = calculateNextDoseAfter(
+  const nextScheduledDose = calculateNextDoseAfterOrNull(
     prescription,
     occurrenceAt,
     prescription.timeZone || "UTC"

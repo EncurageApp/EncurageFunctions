@@ -13,10 +13,12 @@ import {
   notificationV2UsesStaticCanaryOnly,
 } from "./routing";
 import {
-  calculateNextDoseAfter,
+  calculateNextDoseAfterOrNull,
   DueStage,
+  MINUTE_MS,
   resolveDueStage,
   TERMINAL_SEND_GRACE_MS,
+  terminalStageAfterReminder,
 } from "./schedule";
 import {
   dueAtForWorker,
@@ -43,7 +45,9 @@ const BATCH_SIZE = 500;
 const EVENT_CONCURRENCY = 25;
 const LEASE_MS = 6 * 60_000;
 const MAX_RECONCILIATION_HOPS = 20;
-const MAX_RECOVERY_SCAN_PAGES = 20;
+const TERMINAL_LATE_WARNING_MS = MINUTE_MS;
+const TERMINAL_RETRY_MAX_ATTEMPTS = 5;
+const TERMINAL_RETRY_BATCH_SIZE = 100;
 
 type EventCollection = "events" | "prescription_events";
 type EventKind = "as_needed" | "prescription";
@@ -79,7 +83,11 @@ type TerminalSettlementTask = {
   childId: string;
   occurrenceAt: number;
   dueAt: number;
+  enqueuedAt?: number;
+  scheduledFor?: number;
 };
+
+type TerminalSettlementSource = "primary" | "isolated_retry";
 
 const getDb = () => admin.app().database();
 
@@ -95,6 +103,9 @@ const checkpointKey = (
 
 const safeKey = (value: string): string =>
   createHash("sha256").update(value).digest("hex");
+
+const recoveryPriority = (event: any): number =>
+  resolveDueStage(event, Date.now())?.stage === 4 ? 1 : 0;
 
 async function loadUser(uid: string): Promise<any | null> {
   const snapshot = await getDb().ref(`users/${uid}`).once("value");
@@ -344,9 +355,17 @@ async function loadStaleCanaryEvents(
   }
 
   const sortByDueAt = (workerKind: WorkerKind) =>
-    (left: RoutedEvent, right: RoutedEvent) =>
-      dueAtForWorker(left.event, workerKind) -
-      dueAtForWorker(right.event, workerKind);
+    (left: RoutedEvent, right: RoutedEvent) => {
+      if (workerKind === "reminder") {
+        const priority = recoveryPriority(right.event) -
+          recoveryPriority(left.event);
+        if (priority !== 0) return priority;
+      }
+      return (
+        dueAtForWorker(left.event, workerKind) -
+        dueAtForWorker(right.event, workerKind)
+      );
+    };
 
   return {
     initial: [...initial.values()].sort(sortByDueAt("initial")),
@@ -362,77 +381,52 @@ async function loadStaleDueEvents(
   const events = new Map<string, RoutedEvent>();
   const childCache = new Map<string, Promise<any | null>>();
   const dueField = dueFieldForWorker(workerKind);
-  let cursor: {dueAt: number; eventId: string} | null = null;
-  let pageCount = 0;
-  let scannedCount = 0;
-
-  while (pageCount < MAX_RECOVERY_SCAN_PAGES && events.size < BATCH_SIZE) {
-    const pageLimit = cursor ? BATCH_SIZE + 1 : BATCH_SIZE;
-    const snapshot = await getDb()
-      .ref(collection)
-      .orderByChild(dueField)
-      .startAt(cursor?.dueAt ?? Number.MIN_SAFE_INTEGER, cursor?.eventId)
-      .endAt(before)
-      .limitToFirst(pageLimit)
-      .once("value");
-    const page: Array<{eventId: string; event: any; dueAt: number}> = [];
-    snapshot.forEach((eventSnapshot) => {
-      const event = eventSnapshot.val() || {};
-      page.push({
-        eventId: eventSnapshot.key as string,
-        event,
-        dueAt: dueAtForWorker(event, workerKind),
-      });
+  const snapshot = await getDb()
+    .ref(collection)
+    .orderByChild(dueField)
+    .endAt(before)
+    .limitToLast(BATCH_SIZE)
+    .once("value");
+  const page: Array<{eventId: string; event: any; dueAt: number}> = [];
+  snapshot.forEach((eventSnapshot) => {
+    const event = eventSnapshot.val() || {};
+    page.push({
+      eventId: eventSnapshot.key as string,
+      event,
+      dueAt: dueAtForWorker(event, workerKind),
     });
-    pageCount++;
-
-    const newEntries = cursor
-      ? page.filter(
-          ({eventId, dueAt}) =>
-            eventId !== cursor?.eventId || dueAt !== cursor.dueAt
-        )
-      : page;
-    scannedCount += newEntries.length;
-
-    const matchingEntries = newEntries.filter(({event}) =>
-      isWorkerCandidate(
-        event,
-        workerKind,
-        Number.MIN_SAFE_INTEGER,
-        before
-      )
-    );
-    const candidates = await resolveLiveCanaryCandidates(
-      collection,
-      matchingEntries,
-      childCache
-    );
-    candidates.forEach((candidate) => events.set(candidate.eventId, candidate));
-
-    if (page.length < pageLimit) break;
-    const last = page[page.length - 1];
-    if (
-      !last ||
-      (cursor && last.eventId === cursor.eventId && last.dueAt === cursor.dueAt)
-    ) {
-      logger.error("V2 stale discovery pagination made no progress", {
-        collection,
-        workerKind,
-        cursor,
-      });
-      break;
-    }
-    cursor = {dueAt: last.dueAt, eventId: last.eventId};
-  }
+  });
+  const matchingEntries = page.filter(({event}) =>
+    isWorkerCandidate(
+      event,
+      workerKind,
+      Number.MIN_SAFE_INTEGER,
+      before
+    )
+  );
+  const candidates = await resolveLiveCanaryCandidates(
+    collection,
+    matchingEntries,
+    childCache
+  );
+  candidates.forEach((candidate) => events.set(candidate.eventId, candidate));
 
   return {
     candidates: [...events.values()].sort(
-      (left, right) =>
-        dueAtForWorker(left.event, workerKind) -
-        dueAtForWorker(right.event, workerKind)
+      (left, right) => {
+        if (workerKind === "reminder") {
+          const priority = recoveryPriority(right.event) -
+            recoveryPriority(left.event);
+          if (priority !== 0) return priority;
+        }
+        return (
+          dueAtForWorker(right.event, workerKind) -
+          dueAtForWorker(left.event, workerKind)
+        );
+      }
     ),
-    pageCount,
-    scannedCount,
+    pageCount: 1,
+    scannedCount: page.length,
   };
 }
 
@@ -907,7 +901,7 @@ async function finalizePrescriptionTerminal(
   const occurrenceKey =
     existingDose?.id ||
     prescriptionDoseKey(eventId, occurrenceAt);
-  const nextScheduledDose = calculateNextDoseAfter(
+  const nextScheduledDose = calculateNextDoseAfterOrNull(
     prescription,
     occurrenceAt,
     ownerTimeZone
@@ -918,7 +912,9 @@ async function finalizePrescriptionTerminal(
     if (!eventStillMatches(current, observed)) return;
     return {
       ...current,
-      nextScheduledDose,
+      ...(nextScheduledDose === null
+        ? {state: "completed", completedAt: Date.now(), nextScheduledDose: null}
+        : {nextScheduledDose}),
       nextNotificationTime: null,
       notificationCount: null,
       snoozeInterval: null,
@@ -945,6 +941,13 @@ async function finalizePrescriptionTerminal(
   });
   if (!result.committed || !result.snapshot.exists()) return false;
   await materializePendingPrescriptionDose(eventId, result.snapshot.val());
+  if (nextScheduledDose === null) {
+    logger.info("V2 prescription event completed after final occurrence", {
+      eventId,
+      occurrenceAt,
+      prescriptionId: observed.prescriptionId,
+    });
+  }
   return true;
 }
 
@@ -1015,6 +1018,8 @@ async function enqueueTerminalSettlement(
   dueStage: DueStage
 ): Promise<void> {
   const occurrenceAt = Number(event.nextScheduledDose);
+  const enqueuedAt = Date.now();
+  const scheduledFor = terminalSettlementAt(dueStage.dueAt);
   const taskId = safeKey(
     `terminal:${kind}:${eventId}:${occurrenceAt}:${dueStage.dueAt}`
   );
@@ -1024,6 +1029,8 @@ async function enqueueTerminalSettlement(
     childId: String(event.childId),
     occurrenceAt,
     dueAt: dueStage.dueAt,
+    enqueuedAt,
+    scheduledFor,
   };
 
   try {
@@ -1034,7 +1041,7 @@ async function enqueueTerminalSettlement(
       .enqueue(task, {
         id: taskId,
         scheduleTime: new Date(
-          Math.max(Date.now(), terminalSettlementAt(dueStage.dueAt))
+          Math.max(enqueuedAt, scheduledFor)
         ),
         dispatchDeadlineSeconds: 60,
       });
@@ -1043,6 +1050,8 @@ async function enqueueTerminalSettlement(
       kind,
       occurrenceAt,
       dueAt: dueStage.dueAt,
+      enqueuedAt,
+      scheduledFor,
     });
   } catch (error: any) {
     if (
@@ -1137,6 +1146,16 @@ async function processCanaryEvent(
         prescription
       );
 
+      const terminalStage = terminalStageAfterReminder(dueStage);
+      if (terminalStage) {
+        await enqueueTerminalSettlement(
+          kind,
+          candidate.eventId,
+          event,
+          terminalStage
+        );
+      }
+
       const finalized = await finalizeReminder(
         collection,
         candidate.eventId,
@@ -1223,10 +1242,10 @@ async function runRecoveryWorker(collection: EventCollection): Promise<void> {
     startedAt - LIVE_DISCOVERY_LOOKBACK_MS
   );
 
-  await runBatches(stale.initial, (candidate) =>
+  await runBatches(stale.reminder, (candidate) =>
     processCanaryEvent(collection, candidate)
   );
-  await runBatches(stale.reminder, (candidate) =>
+  await runBatches(stale.initial, (candidate) =>
     processCanaryEvent(collection, candidate)
   );
 
@@ -1291,8 +1310,70 @@ export const reconcilePrescriptionNotificationsV2Cron = onSchedule(
   }
 );
 
+const terminalRetryJobId = (task: TerminalSettlementTask): string =>
+  safeKey(
+    `terminal-retry:${task.kind}:${task.eventId}:${task.occurrenceAt}:${task.dueAt}`
+  );
+
+const errorMessage = (error: unknown): string => {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.slice(0, 500);
+};
+
+const terminalTaskLogFields = (
+  task: TerminalSettlementTask,
+  source: TerminalSettlementSource,
+  startedAt: number
+) => {
+  const scheduledFor = Number.isFinite(Number(task.scheduledFor))
+    ? Number(task.scheduledFor)
+    : terminalSettlementAt(Number(task.dueAt));
+  return {
+    kind: task.kind,
+    eventId: task.eventId,
+    childId: task.childId,
+    occurrenceAt: Number(task.occurrenceAt),
+    dueAt: Number(task.dueAt),
+    enqueuedAt: Number(task.enqueuedAt) || null,
+    scheduledFor,
+    startedAt,
+    latenessMs: Math.max(0, startedAt - scheduledFor),
+    dueLatenessMs: Math.max(0, startedAt - Number(task.dueAt)),
+    source,
+  };
+};
+
+async function recordTerminalRetry(
+  task: TerminalSettlementTask,
+  error: unknown
+): Promise<void> {
+  const jobId = terminalRetryJobId(task);
+  const now = Date.now();
+  await getDb()
+    .ref(`notification_v2_terminal_jobs/${jobId}`)
+    .transaction((current) => {
+      if (current !== null) return undefined;
+      return {
+        ...task,
+        jobId,
+        status: "pending",
+        attemptCount: 0,
+        nextAttemptAt: now,
+        lastError: errorMessage(error),
+        createdAt: now,
+        updatedAt: now,
+      };
+    });
+  logger.error("V2 terminal settlement moved to isolated retry", {
+    ...terminalTaskLogFields(task, "primary", now),
+    jobId,
+    error: errorMessage(error),
+  });
+}
+
 async function processTerminalSettlement(
-  task: TerminalSettlementTask
+  task: TerminalSettlementTask,
+  source: TerminalSettlementSource
 ): Promise<void> {
   const {kind, eventId, occurrenceAt, dueAt} = task;
   if (
@@ -1304,7 +1385,14 @@ async function processTerminalSettlement(
     logger.error("V2 terminal settlement received invalid task", {task});
     return;
   }
-  if (Date.now() < terminalSettlementAt(dueAt)) {
+  const startedAt = Date.now();
+  const timing = terminalTaskLogFields(task, source, startedAt);
+  if (timing.latenessMs > TERMINAL_LATE_WARNING_MS) {
+    logger.warn("V2 terminal settlement late", timing);
+  } else {
+    logger.info("V2 terminal settlement started", timing);
+  }
+  if (startedAt < terminalSettlementAt(dueAt)) {
     throw new Error(`Terminal settlement dispatched early: ${eventId}`);
   }
 
@@ -1339,6 +1427,7 @@ async function processTerminalSettlement(
     if (resolutionMatches && resolution.status === "given") return;
     if (resolutionMatches && resolution.status === "skipped") {
       if (kind === "prescription") {
+        await materializePendingPrescriptionDose(eventId, event);
         const givenDose = await findPrescriptionOccurrenceDose(
           eventId,
           occurrenceAt
@@ -1503,10 +1592,10 @@ export const settleNotificationV2Terminal = onTaskDispatched<TerminalSettlementT
     memory: "512MiB",
     timeoutSeconds: 120,
     retryConfig: {
-      maxAttempts: 10,
+      maxAttempts: 2,
       minBackoffSeconds: 5,
-      maxBackoffSeconds: 60,
-      maxRetrySeconds: 900,
+      maxBackoffSeconds: 5,
+      maxRetrySeconds: 30,
     },
     rateLimits: {
       maxConcurrentDispatches: 50,
@@ -1514,7 +1603,96 @@ export const settleNotificationV2Terminal = onTaskDispatched<TerminalSettlementT
     },
   },
   async (request) => {
-    await processTerminalSettlement(request.data);
+    try {
+      await processTerminalSettlement(request.data, "primary");
+    } catch (error) {
+      await recordTerminalRetry(request.data, error);
+    }
+  }
+);
+
+async function processTerminalRetryJob(
+  jobSnapshot: admin.database.DataSnapshot
+): Promise<void> {
+  const now = Date.now();
+  const executionId = randomUUID();
+  const claimed = await jobSnapshot.ref.transaction((current) => {
+    if (current === null) return null;
+    const leaseActive =
+      current.status === "processing" && Number(current.leaseUntil) > now;
+    const pending =
+      current.status === "pending" && Number(current.nextAttemptAt) <= now;
+    if (leaseActive || (!pending && current.status !== "processing")) {
+      return undefined;
+    }
+    return {
+      ...current,
+      status: "processing",
+      retryExecutionId: executionId,
+      leaseUntil: now + LEASE_MS,
+      updatedAt: now,
+    };
+  });
+  if (!claimed.committed || !claimed.snapshot.exists()) return;
+  const job = claimed.snapshot.val() as TerminalSettlementTask & {
+    attemptCount?: number;
+    jobId?: string;
+  };
+
+  try {
+    await processTerminalSettlement(job, "isolated_retry");
+    await jobSnapshot.ref.remove();
+    logger.info("V2 isolated terminal retry completed", {
+      jobId: job.jobId || jobSnapshot.key,
+      eventId: job.eventId,
+      occurrenceAt: job.occurrenceAt,
+    });
+  } catch (error) {
+    const attemptCount = Number(job.attemptCount || 0) + 1;
+    const deadLetter = attemptCount >= TERMINAL_RETRY_MAX_ATTEMPTS;
+    const backoffMs =
+      Math.min(15, 2 ** Math.max(0, attemptCount - 1)) * MINUTE_MS;
+    await jobSnapshot.ref.update({
+      status: deadLetter ? "dead_letter" : "pending",
+      attemptCount,
+      nextAttemptAt: deadLetter ? null : Date.now() + backoffMs,
+      lastError: errorMessage(error),
+      retryExecutionId: null,
+      leaseUntil: null,
+      updatedAt: Date.now(),
+    });
+    logger.error("V2 isolated terminal retry failed", {
+      jobId: job.jobId || jobSnapshot.key,
+      eventId: job.eventId,
+      occurrenceAt: job.occurrenceAt,
+      attemptCount,
+      deadLetter,
+      error: errorMessage(error),
+    });
+  }
+}
+
+export const retryNotificationV2TerminalCron = onSchedule(
+  scheduleOptions,
+  async () => {
+    if (!notificationV2RoutingEnabled) return;
+    const snapshot = await getDb()
+      .ref("notification_v2_terminal_jobs")
+      .orderByChild("nextAttemptAt")
+      .startAt(0)
+      .endAt(Date.now())
+      .limitToFirst(TERMINAL_RETRY_BATCH_SIZE)
+      .once("value");
+    const jobs: admin.database.DataSnapshot[] = [];
+    snapshot.forEach((jobSnapshot) => {
+      if (
+        jobSnapshot.val()?.status === "pending" ||
+        jobSnapshot.val()?.status === "processing"
+      ) {
+        jobs.push(jobSnapshot);
+      }
+    });
+    await runBatches(jobs, processTerminalRetryJob);
   }
 );
 
