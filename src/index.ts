@@ -8,6 +8,7 @@ import { onSchedule } from "firebase-functions/v2/scheduler";
 import { onCall, CallableRequest } from "firebase-functions/v2/https";
 import moment from "moment-timezone";
 import axios from "axios";
+import { createHash } from "crypto";
 import { google } from "googleapis";
 import { getVitalInsightsPayload } from "./vitalInsights";
 import { getSymptomInsightsPayload } from "./symptomInsights";
@@ -2542,6 +2543,70 @@ type VoidedPurchaseLookupResult = {
   };
 };
 
+function sensitiveValueFingerprint(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0) {
+    return null;
+  }
+
+  return createHash("sha256").update(value).digest("hex").slice(0, 12);
+}
+
+function redactSensitiveText(value: unknown): string {
+  return String(value).replace(
+    /[a-z]{24}\.[A-Za-z0-9_-]{20,}/g,
+    "[REDACTED_GOOGLE_PURCHASE_TOKEN]"
+  );
+}
+
+function safeErrorDetails(error: any) {
+  return {
+    name: typeof error?.name === "string" ? error.name : null,
+    code: error?.code ?? null,
+    status: error?.response?.status ?? error?.status ?? null,
+    message:
+      typeof error?.message === "string"
+        ? redactSensitiveText(error.message)
+        : redactSensitiveText(error),
+  };
+}
+
+function googlePurchaseLogSummary(purchase: any) {
+  return {
+    subscriptionState: purchase?.subscriptionState ?? null,
+    paymentState: purchase?.paymentState ?? null,
+    acknowledgementState: purchase?.acknowledgementState ?? null,
+    purchaseState: purchase?.purchaseState ?? null,
+    orderId: purchase?.orderId ?? purchase?.latestOrderId ?? null,
+    latestSuccessfulOrderId:
+      purchase?.lineItems?.[0]?.latestSuccessfulOrderId ?? null,
+    productId: purchase?.lineItems?.[0]?.productId ?? null,
+    basePlanId:
+      purchase?.basePlanId ??
+      purchase?.lineItems?.[0]?.offerDetails?.basePlanId ??
+      null,
+    expiryTime:
+      purchase?.lineItems?.[0]?.expiryTime ??
+      purchase?.expiryTimeMillis ??
+      null,
+    voided: purchase?.voided === true,
+  };
+}
+
+function storedPurchaseLogSummary(purchaseInfo: any) {
+  return {
+    platform: purchaseInfo?.platform ?? null,
+    productId: purchaseInfo?.productId ?? null,
+    basePlanId: purchaseInfo?.basePlanId ?? null,
+    purchaseType: purchaseInfo?.purchaseType ?? null,
+    entitlementType: purchaseInfo?.entitlementType ?? null,
+    subscriptionExpiry: purchaseInfo?.subscriptionExpiry ?? null,
+    hasTransactionReceipt: !!purchaseInfo?.transactionReceipt,
+    purchaseTokenFingerprint: sensitiveValueFingerprint(
+      purchaseInfo?.purchaseToken
+    ),
+  };
+}
+
 function isLikelyLifetimeProductId(productId?: string | null): boolean {
   if (!productId) return false;
   if (LIFETIME_PRODUCT_IDS.has(productId)) return true;
@@ -2748,8 +2813,9 @@ async function getVoidedGooglePurchase(
         logger.warn("Matched voided Google purchase", {
           packageName,
           orderId: matchedPurchase.orderId || matchers.orderId || null,
-          purchaseToken:
-            matchedPurchase.purchaseToken || matchers.purchaseToken || null,
+          purchaseTokenFingerprint: sensitiveValueFingerprint(
+            matchedPurchase.purchaseToken || matchers.purchaseToken
+          ),
           voidedReason: matchedPurchase.voidedReason || null,
           voidedSource: matchedPurchase.voidedSource || null,
           voidedTimeMillis: matchedPurchase.voidedTimeMillis || null,
@@ -2773,9 +2839,10 @@ async function getVoidedGooglePurchase(
     logger.warn("Voided Google purchase lookup failed; skipping voided check.", {
       packageName,
       orderId: matchers.orderId || null,
-      purchaseToken: matchers.purchaseToken || null,
-      message: error?.message || String(error),
-      status: error?.response?.status || error?.status || null,
+      purchaseTokenFingerprint: sensitiveValueFingerprint(
+        matchers.purchaseToken
+      ),
+      error: safeErrorDetails(error),
     });
     return { voided: false };
   }
@@ -2819,7 +2886,7 @@ exports.validatePurchase = v1
 
     logger.log("Validating purchase:", {
       platform,
-      receipt,
+      receiptFingerprint: sensitiveValueFingerprint(receipt),
       packageName,
       productId,
       basePlanId,
@@ -2876,8 +2943,14 @@ exports.validatePurchase = v1
         subscribed: entitlementActive, // true if an entitlement is active
       });
 
-      logger.log("validationResponse", validationResponse);
-      logger.log("validationResponse.status", validationResponse.status);
+      logger.log("Apple purchase validation completed", {
+        userId,
+        status: validationResponse.status,
+        environment: validationResponse.environment || null,
+        productId: resolvedProductId || null,
+        entitlementActive,
+        subscriptionExpiry: subscriptionExpiry?.toISOString() || null,
+      });
 
       return {
         status: validationResponse.status, // Apple status
@@ -2921,7 +2994,11 @@ exports.validatePurchase = v1
             productIdToUse
           );
 
-      logger.log("Google Validation Response:", validationResponse);
+      logger.log("Google purchase validation completed", {
+        userId,
+        purchaseTokenFingerprint: sensitiveValueFingerprint(purchaseToken),
+        ...googlePurchaseLogSummary(validationResponse),
+      });
 
       const isVoidedPurchase = validationResponse?.voided === true;
 
@@ -3016,7 +3093,7 @@ exports.validatePurchase = v1
       };
     }
   } catch (error) {
-    logger.error("Error validating purchase:", error);
+    logger.error("Error validating purchase", safeErrorDetails(error));
     throw new v1.https.HttpsError("internal", "Purchase validation failed.");
   }
 });
@@ -3026,7 +3103,7 @@ exports.checkSubscription = v1
     secrets: [APPSTORE_SHARED_SECRET],
   })
   .https.onCall(async (_, context) => {
-  logger.log("data", _);
+  logger.log("checkSubscription called", { hasData: _ != null });
 
   // Ensure the user is authenticated
   if (!context.auth) {
@@ -3086,11 +3163,10 @@ exports.checkSubscription = v1
       !userData ||
       (!purchaseInfo?.transactionReceipt && !purchaseInfo?.purchaseToken)
     ) {
-      logger.warn(
-        `No subscription data found for user: ${userId}. Data: ${JSON.stringify(
-          userData
-        )}`
-      );
+      logger.warn("No subscription data found for user", {
+        userId,
+        userRecordExists: !!userData,
+      });
       logger.log("checkSubscription early return: missing receipt/token", {
         userId,
         subscribed: userData?.subscribed ?? null,
@@ -3103,9 +3179,10 @@ exports.checkSubscription = v1
       };
     }
 
-    logger.log(
-      `User subscription data retrieved: ${JSON.stringify(purchaseInfo)}`
-    );
+    logger.log("User subscription data retrieved", {
+      userId,
+      ...storedPurchaseLogSummary(purchaseInfo),
+    });
 
     let validationResponse;
     let isSubscribed = false;
@@ -3129,20 +3206,37 @@ exports.checkSubscription = v1
         purchaseInfo.transactionReceipt
       );
 
-      logger.log("Apple validation response:", validationResponse);
+      logger.log("Apple subscription validation completed", {
+        userId,
+        status: validationResponse.status,
+        environment: validationResponse.environment || null,
+        latestReceiptInfoCount: Array.isArray(
+          validationResponse.latest_receipt_info
+        )
+          ? validationResponse.latest_receipt_info.length
+          : 0,
+      });
 
       if (
         validationResponse.status === 0 ||
         validationResponse.status === 21006
       ) {
         const latestReceiptInfo = validationResponse.latest_receipt_info || [];
-        logger.log("Latest receipt info:", latestReceiptInfo);
+        logger.log("Apple latest receipt info parsed", {
+          userId,
+          receiptCount: latestReceiptInfo.length,
+        });
 
         const activeSubscription = hasActiveAppleSubscription(
           latestReceiptInfo,
           now
         );
-        logger.log("activeSubscription: ", activeSubscription);
+        logger.log("Apple active subscription resolved", {
+          userId,
+          productId: activeSubscription?.product_id || null,
+          expiresDateMs: activeSubscription?.expires_date_ms || null,
+          active: !!activeSubscription,
+        });
 
         isSubscribed = !!activeSubscription;
 
@@ -3197,7 +3291,9 @@ exports.checkSubscription = v1
       logger.log("checkSubscription entering Android validation", {
         userId,
         productId: purchaseInfo?.productId || null,
-        purchaseToken: purchaseInfo?.purchaseToken || null,
+        purchaseTokenFingerprint: sensitiveValueFingerprint(
+          purchaseInfo?.purchaseToken
+        ),
         storedPurchaseType: storedPurchaseType || null,
         storedPlatform: purchaseInfo?.platform || null,
         subscribed: userData?.subscribed ?? null,
@@ -3226,7 +3322,13 @@ exports.checkSubscription = v1
             productIdToUse
           );
 
-      logger.log("Google validation response:", validationResponse, productIdToUse);
+      logger.log("Google subscription validation completed", {
+        userId,
+        purchaseTokenFingerprint: sensitiveValueFingerprint(
+          purchaseInfo.purchaseToken
+        ),
+        ...googlePurchaseLogSummary(validationResponse),
+      });
       const resolvedBasePlanId =
         validationResponse?.basePlanId || purchaseInfo?.basePlanId || productIdToUse;
       const isVoidedPurchase = validationResponse?.voided === true;
@@ -3315,7 +3417,7 @@ exports.checkSubscription = v1
       userId,
       isSubscribed,
       subscriptionExpiry,
-      purchaseInfo: updatedPurchaseInfo,
+      purchaseInfo: storedPurchaseLogSummary(updatedPurchaseInfo),
     });
 
     if (isSubscribed === false) {
@@ -3332,7 +3434,10 @@ exports.checkSubscription = v1
       subscriptionExpiry,
     };
   } catch (error) {
-    logger.error(`Error checking subscription for user ${userId}:`, error);
+    logger.error("Error checking subscription", {
+      userId,
+      error: safeErrorDetails(error),
+    });
     throw new v1.https.HttpsError(
       "internal",
       "Failed to check subscription status."
@@ -3365,7 +3470,7 @@ async function validateAppleReceipt(receipt) {
     }
     return response.data;
   } catch (error) {
-    logger.error("Apple receipt validation failed:", error);
+    logger.error("Apple receipt validation failed", safeErrorDetails(error));
     throw error;
   }
 }
@@ -3408,7 +3513,10 @@ async function validateGoogleSubscriptionReceipt(
         });
       legacyResponse = legacy.data;
     } catch (legacyError) {
-      logger.warn("Legacy Google subscription validation failed:", legacyError);
+      logger.warn(
+        "Legacy Google subscription validation failed",
+        safeErrorDetails(legacyError)
+      );
     }
 
     const v2Data: any = v2Response.data || {};
@@ -3482,16 +3590,21 @@ async function validateGoogleSubscriptionReceipt(
           auth: auth,
         });
 
-      logger.log("acknowledge", acknowledge);
-      logger.log("Purchase acknowledged successfully for token:", purchaseToken);
+      logger.log("Google subscription purchase acknowledged", {
+        purchaseTokenFingerprint: sensitiveValueFingerprint(purchaseToken),
+        status: acknowledge.status,
+      });
     }
     logger.log(
       "validateGoogleSubscriptionReceipt v2 response",
-      v2Response.data
+      googlePurchaseLogSummary(v2Response.data)
     );
     return enrichedData;
   } catch (error) {
-    logger.error("Google subscription receipt validation failed:", error);
+    logger.error(
+      "Google subscription receipt validation failed",
+      safeErrorDetails(error)
+    );
     throw error;
   }
 }
@@ -3536,11 +3649,11 @@ async function validateGoogleProductReceipt(purchaseToken, packageName, productI
           requestBody: {},
         });
 
-      logger.log("acknowledge product", acknowledge);
-      logger.log(
-        "Product purchase acknowledged successfully for token:",
-        purchaseToken
-      );
+      logger.log("Google product purchase acknowledged", {
+        purchaseTokenFingerprint: sensitiveValueFingerprint(purchaseToken),
+        productId,
+        status: acknowledge.status,
+      });
     }
 
     if (isPurchased && !isConsumed) {
@@ -3554,17 +3667,26 @@ async function validateGoogleProductReceipt(purchaseToken, packageName, productI
             auth,
           });
 
-        logger.log("consume product", consume);
-        logger.log(
-          "Product purchase consumed successfully for token:",
-          purchaseToken
-        );
+        logger.log("Google product purchase consumed", {
+          purchaseTokenFingerprint: sensitiveValueFingerprint(purchaseToken),
+          productId,
+          status: consume.status,
+        });
       } catch (consumeError: any) {
-        logger.warn("Product purchase consume failed:", consumeError);
+        logger.warn("Google product purchase consume failed", {
+          purchaseTokenFingerprint: sensitiveValueFingerprint(purchaseToken),
+          productId,
+          error: safeErrorDetails(consumeError),
+        });
       }
     }
 
-    logger.log("validateGoogleProductReceipt response", response);
+    logger.log("Google product validation completed", {
+      purchaseTokenFingerprint: sensitiveValueFingerprint(purchaseToken),
+      productId,
+      ...googlePurchaseLogSummary(responseData),
+      consumptionState: responseData?.consumptionState ?? null,
+    });
     return {
       ...responseData,
       consumptionState: responseData?.consumptionState,
@@ -3580,7 +3702,11 @@ async function validateGoogleProductReceipt(purchaseToken, packageName, productI
         : null,
     };
   } catch (error) {
-    logger.error("Google product receipt validation failed:", error);
+    logger.error("Google product receipt validation failed", {
+      purchaseTokenFingerprint: sensitiveValueFingerprint(purchaseToken),
+      productId,
+      error: safeErrorDetails(error),
+    });
     throw error;
   }
 }

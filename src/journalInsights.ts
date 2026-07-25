@@ -1,5 +1,6 @@
 import * as admin from "firebase-admin";
 import * as v1 from "firebase-functions/v1";
+import moment from "moment-timezone";
 
 export type JournalInsightsPreset = "1W" | "4W" | "12W" | "CUSTOM";
 
@@ -11,6 +12,7 @@ export type JournalInsightsSubjectKey =
   | "sleep"
   | "attentionConcentration"
   | "symptomControl"
+  | "emotionalWellbeingMood"
   | "socialWellbeing"
   | "qualityOfLife";
 
@@ -22,6 +24,45 @@ export type JournalInsightsRequest = {
   endAt: number;
   preset: JournalInsightsPreset;
   folderName?: string;
+  timeZone: string;
+};
+
+type JournalMoodKey =
+  | "happy"
+  | "excited"
+  | "hopeful"
+  | "curious"
+  | "confident"
+  | "proud"
+  | "sad"
+  | "depressed"
+  | "upset"
+  | "angry"
+  | "worried"
+  | "stressed"
+  | "lonely";
+
+type JournalMoodSpecialNoteType =
+  | "Newtreatment"
+  | "Changeoftreatment"
+  | "Changeofdose"
+  | "Newtherapy";
+
+type JournalMoodInsights = {
+  days: Array<{
+    dateKey: string;
+    timestamp: number;
+    moods: JournalMoodKey[];
+    specialNotes: Array<{type: JournalMoodSpecialNoteType; text: string}>;
+  }>;
+  distribution: Array<{
+    moodKey: JournalMoodKey;
+    count: number;
+    percentage: number;
+  }>;
+  totalSelections: number;
+  mostFrequent: {moodKeys: JournalMoodKey[]; count: number};
+  longestStreak: {moodKeys: JournalMoodKey[]; days: number};
 };
 
 type JournalInsightsPoint = {
@@ -63,6 +104,7 @@ export type JournalInsightsResponse = {
   stats: JournalInsightsStat[];
   readings: JournalInsightsReadingRow[];
   comments?: Array<{timestamp: number; notes?: string}>;
+  mood?: JournalMoodInsights;
 };
 
 type JournalRecord = {
@@ -94,6 +136,27 @@ type JournalSubjectConfig = {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MAX_RANGE_MS = DAY_MS * 84;
+const JOURNAL_MOOD_KEYS: JournalMoodKey[] = [
+  "happy",
+  "excited",
+  "hopeful",
+  "curious",
+  "confident",
+  "proud",
+  "sad",
+  "depressed",
+  "upset",
+  "angry",
+  "worried",
+  "stressed",
+  "lonely",
+];
+const MOOD_SPECIAL_NOTE_TYPES: JournalMoodSpecialNoteType[] = [
+  "Newtreatment",
+  "Changeoftreatment",
+  "Changeofdose",
+  "Newtherapy",
+];
 
 const JOURNAL_CONFIG: Record<JournalInsightsSubjectKey, JournalSubjectConfig> = {
   pain: {
@@ -321,6 +384,10 @@ const JOURNAL_CONFIG: Record<JournalInsightsSubjectKey, JournalSubjectConfig> = 
       },
     ],
   },
+  emotionalWellbeingMood: {
+    title: "Emotional Wellbeing (Mood)",
+    series: [],
+  },
 };
 
 const SYMPTOM_LABEL_BY_ID: Record<string, string> = {
@@ -405,8 +472,16 @@ const normalizeLookupValue = (value: unknown): string =>
     .trim();
 
 const validateRequest = (data: any): JournalInsightsRequest => {
-  const {childId, subjectKey, symptomId, startAt, endAt, preset, folderName} =
-    data ?? {};
+  const {
+    childId,
+    subjectKey,
+    symptomId,
+    startAt,
+    endAt,
+    preset,
+    folderName,
+    timeZone,
+  } = data ?? {};
 
   if (typeof childId !== "string" || !childId.trim()) {
     throw new v1.https.HttpsError("invalid-argument", "childId is required.");
@@ -468,6 +543,10 @@ const validateRequest = (data: any): JournalInsightsRequest => {
       typeof folderName === "string" && folderName.trim()
         ? folderName.trim()
         : undefined,
+    timeZone:
+      typeof timeZone === "string" && moment.tz.zone(timeZone)
+        ? timeZone
+        : "UTC",
   };
 };
 
@@ -598,6 +677,113 @@ const getComment = (
   return notes ? {timestamp, notes} : undefined;
 };
 
+const isJournalMoodKey = (value: unknown): value is JournalMoodKey =>
+  typeof value === "string" &&
+  (JOURNAL_MOOD_KEYS as string[]).includes(value);
+
+export const buildMoodInsightsFromRecords = (
+  records: JournalRecord[],
+  timeZone: string
+): JournalMoodInsights => {
+  const daysByKey = new Map<
+    string,
+    JournalMoodInsights["days"][number]
+  >();
+  const counts = new Map<JournalMoodKey, number>(
+    JOURNAL_MOOD_KEYS.map((key) => [key, 0])
+  );
+
+  records.forEach((record) => {
+    const timestamp = toNumber(record.data?.dateTime);
+    const subjectData = record.data?.subjects?.emotionalWellbeingMood;
+    if (timestamp === null || !subjectData) {
+      return;
+    }
+
+    const moods = Array.isArray(subjectData.emotionalWellBeing)
+      ? subjectData.emotionalWellBeing.filter(isJournalMoodKey)
+      : [];
+    if (moods.length === 0) {
+      return;
+    }
+    const specialNotes = MOOD_SPECIAL_NOTE_TYPES.flatMap((type) => {
+      const text = subjectData[type];
+      return typeof text === "string" && text.trim()
+        ? [{type, text: text.trim()}]
+        : [];
+    });
+    const zoned = moment(timestamp).tz(timeZone);
+    const dateKey = zoned.format("YYYY-MM-DD");
+    const day = daysByKey.get(dateKey) ?? {
+      dateKey,
+      timestamp: zoned.clone().startOf("day").valueOf(),
+      moods: [],
+      specialNotes: [],
+    };
+    day.moods.push(...moods);
+    day.specialNotes.push(...specialNotes);
+    daysByKey.set(dateKey, day);
+    moods.forEach((mood) => counts.set(mood, (counts.get(mood) ?? 0) + 1));
+  });
+
+  const days = Array.from(daysByKey.values()).sort(
+    (a, b) => a.timestamp - b.timestamp
+  );
+  const totalSelections = Array.from(counts.values()).reduce(
+    (total, count) => total + count,
+    0
+  );
+  const distribution = JOURNAL_MOOD_KEYS.map((moodKey) => ({
+    moodKey,
+    count: counts.get(moodKey) ?? 0,
+    percentage:
+      totalSelections > 0
+        ? ((counts.get(moodKey) ?? 0) / totalSelections) * 100
+        : 0,
+  })).filter((item) => item.count > 0);
+  const highestCount = Math.max(...distribution.map((item) => item.count), 0);
+  const longestByMood = new Map<JournalMoodKey, number>();
+
+  JOURNAL_MOOD_KEYS.forEach((moodKey) => {
+    let longest = 0;
+    let current = 0;
+    let previousDate: moment.Moment | undefined;
+    days.forEach((day) => {
+      if (!day.moods.includes(moodKey)) {
+        return;
+      }
+      const date = moment.tz(day.dateKey, "YYYY-MM-DD", timeZone);
+      current =
+        previousDate && date.diff(previousDate, "days") === 1
+          ? current + 1
+          : 1;
+      longest = Math.max(longest, current);
+      previousDate = date;
+    });
+    longestByMood.set(moodKey, longest);
+  });
+  const longestDays = Math.max(...Array.from(longestByMood.values()), 0);
+
+  return {
+    days,
+    distribution,
+    totalSelections,
+    mostFrequent: {
+      moodKeys: distribution
+        .filter((item) => item.count === highestCount && highestCount > 0)
+        .map((item) => item.moodKey),
+      count: highestCount,
+    },
+    longestStreak: {
+      moodKeys: JOURNAL_MOOD_KEYS.filter(
+        (moodKey) =>
+          longestDays > 0 && longestByMood.get(moodKey) === longestDays
+      ),
+      days: longestDays,
+    },
+  };
+};
+
 const buildStats = (series: JournalInsightsSeries[]): JournalInsightsStat[] => {
   const stats = series.map((item) => {
     const latest = item.points[item.points.length - 1];
@@ -683,6 +869,22 @@ export const getJournalInsightsPayload = async (
   const request = validateRequest(rawData);
   const config = JOURNAL_CONFIG[request.subjectKey];
   const records = await getMatchingRecords(db, request);
+  if (request.subjectKey === "emotionalWellbeingMood") {
+    return {
+      subjectKey: request.subjectKey,
+      title: config.title,
+      range: {
+        startAt: request.startAt,
+        endAt: request.endAt,
+        preset: request.preset,
+      },
+      series: [],
+      stats: [],
+      readings: [],
+      comments: [],
+      mood: buildMoodInsightsFromRecords(records, request.timeZone),
+    };
+  }
   const {series, readings, comments} = buildSeriesFromRecords(
     request,
     records,
