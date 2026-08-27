@@ -111,3 +111,23 @@ test("percentage mode is stable by parent id", () => {
     restore();
   }
 });
+
+test("100 percent routes every valid parent to V2", () => {
+  const {routing, restore} = loadRouting({
+    NOTIFICATION_V2_CANARY_ENABLED: "true",
+    NOTIFICATION_V2_ROLLOUT_MODE: "percentage",
+    NOTIFICATION_V2_ROLLOUT_PERCENT: "100",
+  });
+  try {
+    for (const parentId of ["parent-a", "parent-b", "parent-z", "legacy-owner"]) {
+      const route = routing.getNotificationV2Route(parentId);
+      assert.equal(route.useV2, true);
+      assert.equal(route.reason, "percentage");
+      assert.equal(Number.isInteger(route.bucket), true);
+    }
+    assert.equal(routing.isNotificationV2Owner(undefined), false);
+    assert.equal(routing.isNotificationV2Owner(""), false);
+  } finally {
+    restore();
+  }
+});

@@ -1268,7 +1268,8 @@ const scheduleOptions = {
 
 const recoveryScheduleOptions = {
   ...scheduleOptions,
-  schedule: "*/1 * * * *",
+  // Recovery is a backup path; keep the live workers at one-minute cadence.
+  schedule: "*/5 * * * *",
 };
 
 export const checkEventDosesV2Cron = onSchedule(scheduleOptions, async () => {

@@ -94,7 +94,7 @@ parent mismatches.
 The four delivery workers query and process only the inclusive five-minute live
 window. They no longer enumerate older canary events.
 
-Two separate one-minute recovery workers own timestamps older than the live
+Two separate five-minute recovery workers own timestamps older than the live
 boundary:
 
 - `reconcileEventNotificationsV2Cron`
@@ -106,6 +106,25 @@ all-user modes, recovery queries indexed due fields directly and applies the
 same parent routing decision used by live workers. Existing leases,
 deterministic delivery attempts, and fresh event reads protect the small
 boundary overlap between independent invocations.
+
+## Cost monitoring follow-up
+
+The recovery workers run every five minutes. The four live V2 workers remain on
+the one-minute schedule, and retry workers retain their existing cadence.
+
+After the 48-hour rollout monitoring window:
+
+1. Compare Realtime Database Downloads before and after the V1 shutdown and the
+   V2 rollout change.
+2. Check recovery logs for `initialScannedCount`, `reminderScannedCount`, and
+   candidate counts. High scan counts with zero candidates indicate that
+   recovery is still reading too broadly.
+3. Replace the recovery `limitToLast(500)` scans with a bounded, paginated
+   oldest-first stale window so older records cannot be starved by newer ones.
+4. Review whether the retry workers also need a five-minute schedule, based on
+   queue depth and acceptable retry latency.
+5. Audit analytics callables for whole-child history reads and add date-bounded
+   storage/query paths where usage justifies it.
 
 Recovery preserves the schedule resolver's existing behavior: it sends only the
 latest applicable non-terminal checkpoint while the occurrence remains open,
