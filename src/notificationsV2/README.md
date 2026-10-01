@@ -1,20 +1,39 @@
 # Notification V2 Rollout
 
-This implementation is live-only when explicitly enabled. The default route is
-still the configured UID allowlist. Percentage and all-user routing are available
-only when the rollout mode environment values are changed and redeployed.
+The repository records Notification V2 reaching the 100-percent rollout target.
+Commit `44aacc9` records that rollout target, the Node.js 22 upgrade, and the
+`firebase-functions` 7.3.2 upgrade. The routing code remains explicitly gated
+by deployment environment values and retains the V1 kill-switch fallback.
+
+Status as of August 26, 2026:
+
+1. Phases 1 through 5 are implemented.
+2. Percentage routing, mutually exclusive V1/V2 ownership, and the emergency
+   kill switch are implemented and covered by automated tests.
+3. The repository targets Node.js 22 and `firebase-functions` 7.3.2. Build,
+   lint, and all 35 tests pass locally under Node.js 22.23.2.
+4. The implementation commit is synchronized with `origin/main`.
+5. Live rollout environment values and every deployed function runtime still
+   need to be re-verified after `firebase login --reauth`; the Firebase CLI
+   credentials were expired during this status update.
+6. Cloud Monitoring alerts, post-rollout cost review, legacy runtime-config
+   cleanup, broader database-rules cleanup, and overlapping-occurrence state
+   remain open or require verification as described below.
 
 ## Runtime configuration
 
-Set these environment values for the functions deployment:
+The intended 100-percent rollout deployment values are:
 
 ```text
 NOTIFICATION_V2_CANARY_ENABLED=true
 NOTIFICATION_V2_CANARY_UIDS=l2R5cSW1CKfq8CsU002WsQqb3ui1,9xwWrl1ugPht3bRQTGvLlUHJOog2,tJbkGPwW79bruRe8QQgLHzvrdk73,l26xtne9JTSHpywaD12rs1DB8fZ2,rjeHGFSZBFY6zqaQ95E3rBQHZTh1,zvi7h7AsSqSfacqp7tB89IwHny72
 NOTIFICATION_V2_KILL_SWITCH=false
-NOTIFICATION_V2_ROLLOUT_MODE=canary
-NOTIFICATION_V2_ROLLOUT_PERCENT=0
+NOTIFICATION_V2_ROLLOUT_MODE=percentage
+NOTIFICATION_V2_ROLLOUT_PERCENT=100
 ```
+
+Do not treat the values in this README as proof of live configuration. Verify
+the deployed environment after reauthenticating the Firebase CLI.
 
 `NOTIFICATION_V2_CANARY_ENABLED` defaults to disabled. The UID environment
 value is optional because the same six UIDs are the source-code defaults.
@@ -32,7 +51,7 @@ Percentage routing hashes `parentId` into 10,000 stable buckets, so the same
 parent remains on the same side of the V1/V2 boundary until the configured
 percentage changes.
 
-## Deployment order
+## Initial deployment order
 
 1. Deploy all V2 functions while the canary is disabled.
 2. Deploy the four V1 functions with their canary exclusion guards.
@@ -42,14 +61,14 @@ percentage changes.
 
 Do not deploy V2 live before the V1 guards; that can duplicate notifications.
 
-The canary supports the currently released app database writes. Phase 4 adds
+The rollout supports the currently released app database writes. Phase 4 adds
 backend reconciliation for the app-versus-terminal race without requiring a
 mobile release.
 
 ## Phase 1 work discovery
 
-The canary workers discover live work from the indexed event timestamps before
-looking at older canary records:
+The V2 workers discover live work from the indexed event timestamps before
+looking at older routed records:
 
 1. Query the worker's `nextScheduledDose` or `nextNotificationTime` field for
    the inclusive five-minute live window.
@@ -72,7 +91,7 @@ Both event collections use `parentId` as denormalized routing metadata.
 `children/{childId}.parentId` (with `parent_id` as a legacy fallback) remains
 authoritative.
 
-During the canary:
+Routing behavior:
 
 1. Live discovery can reject an event with a known V1-owned `parentId`
    before reading its child.
@@ -85,9 +104,9 @@ During the canary:
 5. V1-owned events are not modified by the Phase 2 triggers.
 
 V1, current mobile releases, notification timing, and caregiver routing ignore
-this additive field. Before cohort expansion, all active events in the cohort
-must be backfilled and audited for missing children, missing parents, and
-parent mismatches.
+this additive field. Parent-ID backfill and audit were rollout gates; retain
+checks for missing children, missing parents, and parent mismatches as ongoing
+data-integrity monitoring.
 
 ## Phase 3 live and recovery isolation
 
@@ -114,8 +133,8 @@ the one-minute schedule, and retry workers retain their existing cadence.
 
 After the 48-hour rollout monitoring window:
 
-1. Compare Realtime Database Downloads before and after the V1 shutdown and the
-   V2 rollout change.
+1. Compare Realtime Database Downloads before and after V1 ownership reached
+   zero percent and the V2 rollout change.
 2. Check recovery logs for `initialScannedCount`, `reminderScannedCount`, and
    candidate counts. High scan counts with zero candidates indicate that
    recovery is still reading too broadly.
@@ -200,9 +219,12 @@ sustained-rate policy so both one late terminal task and a queue-level incident
 remain visible. Also create alerts for `V2 isolated terminal retry failed` and
 jobs reaching `dead_letter`.
 
-Monitoring status as of July 11, 2026: structured lateness logging is deployed.
-The Cloud Monitoring alert policy and notification channel are not yet created;
-this does not affect terminal processing or mobile push delivery.
+Monitoring status: structured lateness logging was verified as deployed on
+July 11, 2026. At that time, the Cloud Monitoring alert policy and notification
+channel had not been created. Their current state was not re-verified on
+August 26 because Firebase CLI authentication had expired. This does not affect
+terminal processing or mobile push delivery, but it can prevent proactive
+incident notification.
 
 Phase 4 deployment order is mandatory:
 
@@ -217,7 +239,7 @@ Phase 4 deployment order is mandatory:
 
 Do not deploy the enqueueing worker revisions before steps 1 and 2.
 
-Terminal reliability production status as of July 11, 2026:
+Terminal reliability production status last verified on July 11, 2026:
 
 1. The `notification_v2_terminal_jobs/.indexOn` rule was added.
 2. `retryNotificationV2TerminalCron`, `settleNotificationV2Terminal`,
@@ -229,8 +251,8 @@ Terminal reliability production status as of July 11, 2026:
    not consume the second primary attempt.
 4. `retryNotificationV2TerminalCron` completed its first production invocation
    with HTTP 200.
-5. The remaining operational step is creating the Cloud Monitoring alert and
-   selecting its notification channel.
+5. Creating or verifying the Cloud Monitoring alert and selecting its
+   notification channel remains an operational follow-up.
 
 ## Phase 5 rollout controls
 
@@ -241,44 +263,44 @@ routing module. This keeps ownership mutually exclusive:
 - If routing returns V1, V2 rejects the event and V1 keeps processing it.
 - `NOTIFICATION_V2_KILL_SWITCH=true` makes routing return V1 for every parent.
 
-Recommended production expansion:
+The repository records the rollout reaching 100 percent in commit `44aacc9`.
+The expansion sequence used by this runbook was:
 
 1. Keep `NOTIFICATION_V2_ROLLOUT_MODE=canary` until Phase 4 behavior is clean.
-2. Deploy Phase 5 code without changing rollout env values.
-3. Move to `NOTIFICATION_V2_ROLLOUT_MODE=percentage` with
-   `NOTIFICATION_V2_ROLLOUT_PERCENT=5`.
-4. Hold 24 hours, then move to `10`, `25`, `50`, and `100` as metrics stay
-   clean.
-5. Use `NOTIFICATION_V2_KILL_SWITCH=true` for emergency rollback, then deploy
-   V1 first and V2 second if code rollback is needed.
+2. Deploy Phase 5 code without changing rollout environment values.
+3. Move to percentage mode at 5 percent.
+4. Hold and monitor each cohort before moving through 10, 25, 50, and 100
+   percent.
+5. Keep `NOTIFICATION_V2_KILL_SWITCH=true` available for emergency rollback,
+   deploying V1 first and V2 second if code rollback is needed.
 
-## Required before replacing V1
+## Historical gate before replacing V1
 
-Do not expand V2 beyond the UID canary until Phase 4 has been verified in
-production and Phase 5 routing controls have been deployed without changing
-the current `canary` rollout mode. This is a mandatory changeover gate, not an
-optional follow-up.
+The rollout required Phase 4 production verification and deployment of the
+Phase 5 routing controls before expanding beyond the UID canary. Preserve this
+gate if V2 is rolled back and expanded again.
 
-## Follow-up checklist
+## Post-rollout checklist
 
-Notification rollout:
+Live verification and monitoring:
 
-1. Monitor canary logs after the Phase 5 deploy. Confirm V1 logs
-   `V1 skipping V2-owned event` and V2 logs `V2 accepted routed event` for the
-   same routed parents.
-2. Start percentage rollout by setting:
+1. Reauthenticate the Firebase CLI and verify the deployed values are:
 
    ```text
    NOTIFICATION_V2_ROLLOUT_MODE=percentage
-   NOTIFICATION_V2_ROLLOUT_PERCENT=5
+   NOTIFICATION_V2_ROLLOUT_PERCENT=100
+   NOTIFICATION_V2_KILL_SWITCH=false
    ```
 
-3. Deploy with `NOTIFICATION_V2_KILL_SWITCH=false`.
-4. Hold for 24 hours and watch skipped-dose correctness, accepted push
-   attempts, stale-token cleanup, retry jobs, terminal settlement tasks, and
-   duplicate notification reports.
-5. Increase to `10`, `25`, `50`, and `100` only after the previous cohort is
-   clean.
+2. Verify every deployed notification function uses Node.js 22. A status check
+   before the final rollout commit showed a mixed Node.js 20/22 deployment.
+3. Confirm logs show V1 skipping V2-owned events and V2 accepting routed events
+   without duplicate ownership.
+4. Complete the 48-hour review of skipped-dose correctness, accepted push
+   attempts, stale-token cleanup, retry jobs, terminal settlement tasks,
+   duplicate reports, and Realtime Database downloads.
+5. Confirm Cloud Monitoring alerts and notification channels exist for terminal
+   lateness, isolated terminal retry failures, and dead-letter jobs.
 6. If rollout needs to stop immediately, set:
 
    ```text
@@ -289,16 +311,18 @@ Notification rollout:
 
 Operational cleanup:
 
-1. Runtime: move from Node.js 20 to Node.js 22 before the October 30, 2026
-   decommission date. Do not move directly to Node.js 24 while first-generation
-   functions still exist.
-2. Dependencies: upgrade `firebase-functions` in a separate pass and retest all
-   callable, scheduled, database-trigger, and task-queue functions.
-3. Legacy runtime config: deploy currently warns about `functions.config()`.
+1. Runtime and dependencies: the repository now targets Node.js 22 and
+   `firebase-functions` 7.3.2. Build, lint, and all 35 automated tests pass
+   under Node.js 22.23.2. Live runtime verification and emulator smoke tests for
+   callable, scheduled, database-trigger, and task-queue functions remain.
+2. Package metadata: `package.json` is version `0.2.0`, while the lockfile root
+   metadata still says `0.1.14`. Synchronize the lockfile metadata in the next
+   package-maintenance change.
+3. Legacy runtime config: deploy previously warned about `functions.config()`.
    Source and compiled output no longer contain `functions.config()` calls, but
-   Firebase still has legacy runtime config stored under Google Play
-   credentials. Confirm no deployed purchase/subscription function still reads
-   the legacy config, then remove the stale runtime config with:
+   Firebase was previously recorded as still having legacy runtime config under
+   Google Play credentials. Confirm no deployed purchase/subscription function
+   still reads it, then remove the stale runtime config with:
 
    ```sh
    firebase functions:config:unset googleplay
@@ -385,9 +409,13 @@ array when the broader rules change is deployed.
 
 ## Rollback
 
-1. Set `NOTIFICATION_V2_CANARY_ENABLED=false`.
-2. Deploy the V1 functions first so they resume canary processing.
-3. Disable or deploy the V2 functions with the same setting.
+1. Set `NOTIFICATION_V2_KILL_SWITCH=true`.
+2. Deploy the V1 functions first so they resume ownership for every parent.
+3. Deploy the V2 functions with the same kill-switch value so they reject all
+   routed work.
+
+Setting `NOTIFICATION_V2_CANARY_ENABLED=false` also routes every parent to V1,
+but the explicit kill switch is the preferred emergency control.
 
 V2 retains the existing event scheduling fields, so V1 can resume from the
 stored `nextScheduledDose`, `nextNotificationTime`, and `notificationCount`.

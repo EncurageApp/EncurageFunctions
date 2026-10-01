@@ -17,6 +17,7 @@ import { getGrowthInsightsPayload } from "./growthInsights";
 import { getJournalInsightsPayload } from "./journalInsights";
 import { getMedicationInsightsPayload } from "./medicationInsights";
 import { getNotificationV2Route } from "./notificationsV2/routing";
+import { normalizeSnoozeInterval } from "./notificationTiming";
 
 export {
   checkEventDosesV2Cron,
@@ -1060,30 +1061,31 @@ function updateEventNotificationCount(
   eventId: string,
   currentTime: number
 ) {
+  const snoozeInterval = normalizeSnoozeInterval(event.snoozeInterval);
   let nextNotificationTime: number;
   // Calculate next notification time based on notification count and snoozeInterval
   switch (event.notificationCount) {
     case 1:
       nextNotificationTime =
-        currentTime + (event.snoozeInterval || 10) * 60 * 1000;
+        currentTime + (snoozeInterval ?? 10) * 60 * 1000;
       break;
     case 2:
       nextNotificationTime =
-        currentTime + (event.snoozeInterval || 25) * 60 * 1000;
+        currentTime + (snoozeInterval ?? 25) * 60 * 1000;
       break;
     case 3:
       nextNotificationTime =
-        currentTime + (event.snoozeInterval || 15) * 60 * 1000;
+        currentTime + (snoozeInterval ?? 15) * 60 * 1000;
       break;
     case 4:
       nextNotificationTime =
-        currentTime + (event.snoozeInterval || 15) * 60 * 1000;
+        currentTime + (snoozeInterval ?? 15) * 60 * 1000;
       break;
     default:
       // Normalize missing/unknown counts to first reminder timing
       event.notificationCount = 1;
       nextNotificationTime =
-        currentTime + (event.snoozeInterval || 10) * 60 * 1000;
+        currentTime + (snoozeInterval ?? 10) * 60 * 1000;
       break;
   }
   const newNotificationCount = event.notificationCount + 1;
@@ -1109,29 +1111,30 @@ export async function updatePrescriptionEventNotificationCount(
   timeZone: string
 ): Promise<void> {
   // --- 1) compute nextNotificationTime (same logic you had) ---
+  const snoozeInterval = normalizeSnoozeInterval(event.snoozeInterval);
   let nextNotificationTime: number | undefined;
   switch (event.notificationCount) {
     case 1:
       nextNotificationTime =
-        currentTime + (event.snoozeInterval || 10) * 60 * 1000;
+        currentTime + (snoozeInterval ?? 10) * 60 * 1000;
       break;
     case 2:
       nextNotificationTime =
-        currentTime + (event.snoozeInterval || 25) * 60 * 1000;
+        currentTime + (snoozeInterval ?? 25) * 60 * 1000;
       break;
     case 3:
       nextNotificationTime =
-        currentTime + (event.snoozeInterval || 15) * 60 * 1000;
+        currentTime + (snoozeInterval ?? 15) * 60 * 1000;
       break;
     case 4:
       nextNotificationTime =
-        currentTime + (event.snoozeInterval || 15) * 60 * 1000;
+        currentTime + (snoozeInterval ?? 15) * 60 * 1000;
       break;
     default:
       // Normalize missing/unknown counts to first reminder timing
       event.notificationCount = 1;
       nextNotificationTime =
-        currentTime + (event.snoozeInterval || 10) * 60 * 1000;
+        currentTime + (snoozeInterval ?? 10) * 60 * 1000;
       break;
   }
 

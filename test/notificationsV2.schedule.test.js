@@ -82,6 +82,58 @@ test("preserves snooze intervals for every remaining checkpoint", () => {
   });
 });
 
+test("null sentinels preserve every reminder boundary and the terminal deadline", () => {
+  const event = {
+    nextScheduledDose: atMinutes(480),
+    nextNotificationTime: atMinutes(490),
+    notificationCount: 1,
+  };
+  for (const minutes of [489, 490, 499, 500, 524, 525, 539, 540, 2_000]) {
+    assert.deepEqual(
+      resolveDueStage({...event, snoozeInterval: {__rnfbNull: true}}, atMinutes(minutes)),
+      resolveDueStage(event, atMinutes(minutes)),
+      `checkpoint at minute ${minutes}`
+    );
+  }
+  const terminal = resolveDueStage(
+    {...event, snoozeInterval: {__rnfbNull: true}},
+    atMinutes(2_000)
+  );
+  assert.equal(terminal.stage, 4);
+  assert.equal(terminal.dueAt, atMinutes(540));
+  assert.doesNotThrow(() => new Date(terminal.dueAt + 30_000).toISOString());
+});
+
+test("cleared iOS notification fields do not make a future occurrence due", () => {
+  const event = {
+    nextScheduledDose: atMinutes(480),
+    nextNotificationTime: {__rnfbNull: true},
+    notificationCount: {__rnfbNull: true},
+    snoozeInterval: {__rnfbNull: true},
+  };
+  assert.equal(resolveDueStage(event, atMinutes(479)), null);
+  const initial = resolveDueStage(event, atMinutes(480));
+  assert.equal(initial.stage, 0);
+  assert.equal(initial.nextNotificationTime, atMinutes(490));
+  const terminal = resolveDueStage(event, atMinutes(541));
+  assert.equal(terminal.stage, 4);
+  assert.equal(terminal.dueAt, atMinutes(540));
+});
+
+test("legacy numeric-string snoozes retain the same remaining checkpoints", () => {
+  const event = {
+    nextScheduledDose: atMinutes(480),
+    nextNotificationTime: atMinutes(505),
+    notificationCount: 1,
+  };
+  for (const minutes of [505, 520, 535, 550]) {
+    assert.deepEqual(
+      resolveDueStage({...event, snoozeInterval: "15"}, atMinutes(minutes)),
+      resolveDueStage({...event, snoozeInterval: 15}, atMinutes(minutes))
+    );
+  }
+});
+
 test("calculates the next hourly occurrence from the previous schedule", () => {
   const start = Date.UTC(2026, 5, 29, 8, 0, 0);
   const prescription = {

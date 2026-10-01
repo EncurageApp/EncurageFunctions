@@ -1,4 +1,5 @@
 import moment from "moment-timezone";
+import {normalizeSnoozeInterval} from "../notificationTiming";
 
 export const MINUTE_MS = 60_000;
 export const TERMINAL_SEND_GRACE_MS = 10 * MINUTE_MS;
@@ -42,17 +43,18 @@ const defaultIntervalsAfterStage: Record<0 | 1 | 2 | 3, number> = {
 
 const intervalAfterStage = (
   stage: NotificationStage,
-  snoozeInterval?: number
+  snoozeInterval?: unknown
 ): number => {
   if (stage >= 4) return 0;
   if (stage === 0) return 10;
-  return snoozeInterval || defaultIntervalsAfterStage[stage as 1 | 2 | 3];
+  return normalizeSnoozeInterval(snoozeInterval) ??
+    defaultIntervalsAfterStage[stage as 1 | 2 | 3];
 };
 
 const nextStageTime = (
   dueAt: number,
   stage: NotificationStage,
-  snoozeInterval?: number
+  snoozeInterval?: unknown
 ): number => dueAt + intervalAfterStage(stage, snoozeInterval) * MINUTE_MS;
 
 export function resolveDueStage(event: any, now: number): DueStage | null {
